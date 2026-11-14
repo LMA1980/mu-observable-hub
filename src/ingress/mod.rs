@@ -96,14 +96,6 @@ pub struct IngressUpstreamState {
     pub consecutive_failures: AtomicU32,
 }
 
-/// Constant-time byte comparison preventing timing side-channel attacks.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 /// Reads a trimmed non-empty string from an environment variable.
 pub(crate) fn non_empty_env(key: &str) -> Option<String> {
     std::env::var(key)
@@ -464,7 +456,7 @@ impl IngressEngine {
             }
         };
 
-        // 2. Authentication gate: validate token with constant-time equality
+        // 2. Authentication gate: fail-closed mu-auth edge proxy / constant-time Bearer validation
         if route.auth_required {
             let auth_header = req
                 .headers()
@@ -477,19 +469,57 @@ impl IngressEngine {
                 })
                 .map(str::trim);
 
-            let expected_token = non_empty_env("MUOBSERVE_BEARER_TOKEN")
-                .or_else(|| non_empty_env("MUOBSERVE_OPERATOR_TOKEN"))
-                .or_else(|| non_empty_env("MUOBSERVE_INGRESS_ADMIN_TOKEN"))
-                .or_else(|| non_empty_env("MUCONDE_CD_API_TOKEN"));
+            let expected_token = mu_auth::resolve_secret_with_file_var(
+                "MUOBSERVE_BEARER_TOKEN",
+                "MUOBSERVE_BEARER_TOKEN_FILE",
+            )
+            .or_else(|| {
+                mu_auth::resolve_secret_with_file_var(
+                    "MUOBSERVE_OPERATOR_TOKEN",
+                    "MUOBSERVE_OPERATOR_TOKEN_FILE",
+                )
+            })
+            .or_else(|| {
+                mu_auth::resolve_secret_with_file_var(
+                    "MUOBSERVE_INGRESS_ADMIN_TOKEN",
+                    "MUOBSERVE_INGRESS_ADMIN_TOKEN_FILE",
+                )
+            })
+            .or_else(|| {
+                mu_auth::resolve_secret_with_file_var(
+                    "MUCONDE_CD_API_TOKEN",
+                    "MUCONDE_CD_API_TOKEN_FILE",
+                )
+            });
 
-            let authenticated = match (presented_token, expected_token) {
-                (Some(presented), Some(expected)) => {
-                    constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            let bearer_authenticated = match (presented_token, expected_token) {
+                (Some(presented), Some(expected)) if !presented.is_empty() => {
+                    mu_auth::constant_time_str_eq(presented, &expected)
                 }
                 _ => false,
             };
 
-            if !authenticated {
+            let edge_authenticated = if !bearer_authenticated && auth_header.is_none() {
+                if let Ok(cfg) = mu_auth::EdgeAuthConfig::from_env(
+                    "MUOBSERVE_PROXY_SECRET",
+                    "MUOBSERVE_PROXY_SECRET_FILE",
+                    false,
+                ) {
+                    let adapter = mu_auth::GithubEdgeAuthAdapter::new(cfg);
+                    let pairs: Vec<(&str, &str)> = req
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                        .collect();
+                    adapter.require_authenticated_headers(&pairs, None).is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !bearer_authenticated && !edge_authenticated {
                 return Ok(axum::response::Response::builder()
                     .status(axum::http::StatusCode::UNAUTHORIZED)
                     .header(
@@ -498,7 +528,7 @@ impl IngressEngine {
                     )
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
-                        "{\"error\":\"Unauthorized: valid Bearer token required\",\"status\":401}",
+                        "{\"error\":\"Unauthorized: valid mu-auth session or Bearer credential required\",\"status\":401}",
                     ))
                     .unwrap_or_default());
             }

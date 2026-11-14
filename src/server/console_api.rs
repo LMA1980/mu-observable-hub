@@ -26,7 +26,7 @@ use crate::analytics::smartscape::{
 use crate::error::MuObserveError;
 use crate::ingress::{IngressEngine, UpstreamHealthChecker};
 use crate::server::auth::{
-    authorize_http_request, DefaultObsAuthGuard, ObsAuthVerifier, ObsPermission,
+    authorize_http_request, MuAuthFolioVerifier, ObsAuthVerifier, ObsPermission,
 };
 use crate::server::sanitize::PrivacyRedactor;
 use crate::server::subsystem_status::{
@@ -228,7 +228,7 @@ pub fn build_console_api_router_with_ingress(
     store: HotDuckDbStore,
     ingress: Arc<IngressEngine>,
 ) -> Router {
-    let auth: Arc<dyn ObsAuthVerifier> = Arc::new(DefaultObsAuthGuard::from_env());
+    let auth: Arc<dyn ObsAuthVerifier> = Arc::new(MuAuthFolioVerifier::from_env());
     build_console_api_router_with_auth(store, ingress, auth)
 }
 
@@ -444,7 +444,7 @@ async fn handle_get_smartscape(
     headers: HeaderMap,
     q_res: Result<Query<SmartscapeQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::SmartscapeRead) {
         return *resp;
     }
     let Query(params) = match q_res {
@@ -548,7 +548,7 @@ async fn handle_get_problems(
     headers: HeaderMap,
     q_res: Result<Query<SmartscapeQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ProblemsRead) {
         return *resp;
     }
     let Query(params) = match q_res {
@@ -591,7 +591,7 @@ async fn handle_get_problem_events_sse(
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ProblemsRead) {
         return *resp;
     }
     let initial_problems =
@@ -763,7 +763,7 @@ async fn handle_get_ingress_routes(
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressRead) {
         return *resp;
     }
     let routes = engine.get_route_dtos().await;
@@ -775,7 +775,7 @@ async fn handle_get_ingress_upstreams(
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressRead) {
         return *resp;
     }
     let upstreams = engine.get_upstream_dtos().await;
@@ -787,7 +787,7 @@ async fn handle_get_ingress_overview(
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressRead) {
         return *resp;
     }
     let overview = engine.get_overview_dto().await;
@@ -918,11 +918,16 @@ async fn handle_post_ingress_route(
     State(engine): State<Arc<IngressEngine>>,
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
-    Json(payload): Json<IngressRouteCreateRequest>,
+    payload_res: Result<Json<IngressRouteCreateRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressWrite) {
         return *resp;
     }
+
+    let Json(payload) = match payload_res {
+        Ok(p) => p,
+        Err(err) => return err.into_response(),
+    };
 
     if let Err(ssrf_err) = validate_upstream_url_ssrf(&payload.upstream_url) {
         return no_store_json(
@@ -965,11 +970,19 @@ async fn handle_post_ingress_tls(
     State(engine): State<Arc<IngressEngine>>,
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
-    Json(payload): Json<crate::ingress::TlsHealthDto>,
+    payload_res: Result<
+        Json<crate::ingress::TlsHealthDto>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Response {
     if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressWrite) {
         return *resp;
     }
+
+    let Json(payload) = match payload_res {
+        Ok(p) => p,
+        Err(err) => return err.into_response(),
+    };
 
     engine.set_tls_health(payload).await;
     no_store_json(
@@ -1218,7 +1231,7 @@ async fn handle_get_log_facets(
     headers: HeaderMap,
     q_res: Result<Query<LogFacetsParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::LogsRead) {
         return *resp;
     }
     let Query(params) = match q_res {
@@ -1333,7 +1346,7 @@ async fn handle_get_traces(
     headers: HeaderMap,
     q_res: Result<Query<TraceListQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::TracesRead) {
         return *resp;
     }
     let Query(params) = match q_res {
@@ -1405,7 +1418,7 @@ async fn handle_get_trace_purepath(
     headers: HeaderMap,
     AxumPath(trace_id): AxumPath<String>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::TracesRead) {
         return *resp;
     }
     if let Err(msg) = validate_safe_filter_token(&trace_id) {
@@ -1428,7 +1441,7 @@ async fn handle_get_logs(
     headers: HeaderMap,
     q_res: Result<Query<LogsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::LogsRead) {
         return *resp;
     }
     let Query(params) = match q_res {
@@ -1504,7 +1517,7 @@ async fn handle_get_job_log(
     headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::LogsRead) {
         return *resp;
     }
     if let Err(msg) = validate_safe_filter_token(&job_id) {
@@ -1783,7 +1796,7 @@ async fn handle_get_metrics(
     headers: HeaderMap,
     q_res: Result<Query<MetricsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::MetricsRead) {
         return *resp;
     }
     let Query(params) = match q_res {
@@ -1996,7 +2009,7 @@ async fn handle_get_store_status(
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::StoreRead) {
         return *resp;
     }
     match collect_storage_health_status(&store) {

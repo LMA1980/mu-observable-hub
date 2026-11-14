@@ -5,7 +5,7 @@ pub mod sanitize;
 pub mod subsystem_status;
 
 pub use auth::{
-    authorize_http_request, AuthContext, AuthRejection, DefaultObsAuthGuard, ObsAuthVerifier,
+    authorize_http_request, AuthContext, AuthRejection, MuAuthFolioVerifier, ObsAuthVerifier,
     ObsPermission,
 };
 pub use console_api::{

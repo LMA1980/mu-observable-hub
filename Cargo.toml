@@ -24,6 +24,7 @@ name = "mu-observable-cli"
 path = "src/bin/muobserve_cli.rs"
 
 [dependencies]
+mu-auth = { git = "https://github.com/LMA1980/mu-auth.git", rev = "b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951", default-features = false, features = ["std", "github-oauth"] }
 mu-observable-ipc = { git = "https://github.com/LMA1980/mu-observable-ipc.git", branch = "main" }
 mu-ci-isolation = { git = "https://github.com/LMA1980/mu-ci-isolation.git", branch = "main" }
 duckdb = { version = "=1.2.2", default-features = false }

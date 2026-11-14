@@ -1336,7 +1336,7 @@ mod tests {
             let req = SubsystemMaintenanceRequest {
                 state: Some(state_str.to_string()),
                 summary: Some(
-                    "Upgrade on https://192.168.10.22:8443 bearer=sk-testsecret999".to_string(),
+                    "Upgrade on https://10.20.30.40:8443 bearer=sk-testsecret999".to_string(),
                 ),
                 duration_secs: Some(60),
                 actor: Some("operator-1".into()),
@@ -1349,7 +1349,7 @@ mod tests {
             assert_eq!(dto.mode, SubsystemOverrideMode::Manual);
             assert_eq!(dto.mode_label, "Manual Override");
             assert_eq!(dto.expires_at_ms, Some(t0 + 60_000));
-            assert!(!dto.summary.contains("192.168.10.22"));
+            assert!(!dto.summary.contains("10.20.30.40"));
             assert!(!dto.summary.contains("sk-testsecret999"));
             assert!(ev.subsystem_status_changed);
         }
