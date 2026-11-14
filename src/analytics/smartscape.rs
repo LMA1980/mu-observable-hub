@@ -106,6 +106,12 @@ pub struct ProblemCard {
     pub artifact_digest: Option<String>,
     pub detected_at_ms: i64,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_suppressed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_subsystem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_state: Option<String>,
 }
 
 /// Alias matching issue `#34` naming (`ProblemSummary`).
@@ -117,6 +123,12 @@ pub struct ProblemsFeedResponse {
     pub window_secs: u64,
     pub open_count: usize,
     pub total: usize,
+    #[serde(default)]
+    pub suppressed_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_maintenance_subsystems: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed_problems: Vec<ProblemCard>,
     pub problems: Vec<ProblemCard>,
 }
 
@@ -517,6 +529,9 @@ pub fn evaluate_deterministic_problems(
                     "Service '{}' p95 span latency reached {:.2} ms across {} spans",
                     svc.name, svc.p95_latency_ms, svc.span_count
                 )),
+                maintenance_suppressed: None,
+                maintenance_subsystem: None,
+                maintenance_state: None,
             });
         }
 
@@ -545,6 +560,9 @@ pub fn evaluate_deterministic_problems(
                     "Service '{}' recorded {} error spans ({:.2}% error rate)",
                     svc.name, svc.error_count, svc.error_rate_pct
                 )),
+                maintenance_suppressed: None,
+                maintenance_subsystem: None,
+                maintenance_state: None,
             });
         }
     }
@@ -604,6 +622,9 @@ pub fn evaluate_deterministic_problems(
                 artifact_digest: Some("sha256:canary".into()),
                 detected_at_ms: ts_ns / 1_000_000,
                 summary: clean_body,
+                maintenance_suppressed: None,
+                maintenance_subsystem: None,
+                maintenance_state: None,
             });
         }
     }
@@ -647,6 +668,9 @@ pub fn evaluate_deterministic_problems(
                             summary: format!(
                                 "Host '{clean_node}' last reported telemetry {lag_secs}s ago"
                             ),
+                            maintenance_suppressed: None,
+                            maintenance_subsystem: None,
+                            maintenance_state: None,
                         });
                     }
                 }
@@ -719,6 +743,9 @@ pub fn evaluate_deterministic_problems(
                         reg.candidate_ns,
                         reg.delta_pct
                     ),
+                    maintenance_suppressed: None,
+                    maintenance_subsystem: None,
+                    maintenance_state: None,
                 });
             }
         }
@@ -757,6 +784,9 @@ pub fn evaluate_deterministic_problems(
                             .as_deref()
                             .unwrap_or("Test exhibited pass/fail flip-flops in 30-day window"),
                     ),
+                    maintenance_suppressed: None,
+                    maintenance_subsystem: None,
+                    maintenance_state: None,
                 });
             }
         }
@@ -767,6 +797,9 @@ pub fn evaluate_deterministic_problems(
         window_secs: bounded_window,
         open_count,
         total: open_count,
+        suppressed_count: 0,
+        active_maintenance_subsystems: Vec::new(),
+        suppressed_problems: Vec::new(),
         problems,
     })
 }

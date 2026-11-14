@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path as AxumPath, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use duckdb::params;
@@ -25,14 +25,24 @@ use crate::analytics::smartscape::{
 };
 use crate::error::MuObserveError;
 use crate::ingress::{IngressEngine, UpstreamHealthChecker};
+use crate::server::auth::{
+    authorize_http_request, DefaultObsAuthGuard, ObsAuthVerifier, ObsPermission,
+};
 use crate::server::sanitize::PrivacyRedactor;
+use crate::server::subsystem_status::{
+    apply_maintenance_policy_to_causal_cards, CausalMaintenanceFilterOutcome, MaintenanceCommand,
+    PlatformSubsystemId, SubsystemMaintenanceRequest, SubsystemStatusRegistry,
+};
 use crate::storage::hot_duckdb::HotDuckDbStore;
 use crate::DEFAULT_HOT_RETENTION_DAYS;
 
+/// Shared Axum router state backing observability, ingress, subsystem status, and authorization gates.
 #[derive(Clone)]
 pub struct ConsoleApiState {
     pub store: HotDuckDbStore,
     pub ingress: Arc<IngressEngine>,
+    pub subsystems: Arc<SubsystemStatusRegistry>,
+    pub auth: Arc<dyn ObsAuthVerifier>,
 }
 
 impl axum::extract::FromRef<ConsoleApiState> for HotDuckDbStore {
@@ -44,6 +54,18 @@ impl axum::extract::FromRef<ConsoleApiState> for HotDuckDbStore {
 impl axum::extract::FromRef<ConsoleApiState> for Arc<IngressEngine> {
     fn from_ref(state: &ConsoleApiState) -> Self {
         state.ingress.clone()
+    }
+}
+
+impl axum::extract::FromRef<ConsoleApiState> for Arc<SubsystemStatusRegistry> {
+    fn from_ref(state: &ConsoleApiState) -> Self {
+        state.subsystems.clone()
+    }
+}
+
+impl axum::extract::FromRef<ConsoleApiState> for Arc<dyn ObsAuthVerifier> {
+    fn from_ref(state: &ConsoleApiState) -> Self {
+        Arc::clone(&state.auth)
     }
 }
 
@@ -201,11 +223,35 @@ pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
     build_console_api_router_with_ingress(store, ingress)
 }
 
+/// Builds the console observability and control-plane router with default environment auth policy.
 pub fn build_console_api_router_with_ingress(
     store: HotDuckDbStore,
     ingress: Arc<IngressEngine>,
 ) -> Router {
-    let state = ConsoleApiState { store, ingress };
+    let auth: Arc<dyn ObsAuthVerifier> = Arc::new(DefaultObsAuthGuard::from_env());
+    build_console_api_router_with_auth(store, ingress, auth)
+}
+
+/// Builds the console router with explicit `ingress` engine and [`ObsAuthVerifier`] policy implementation.
+pub fn build_console_api_router_with_auth(
+    store: HotDuckDbStore,
+    ingress: Arc<IngressEngine>,
+    auth: Arc<dyn ObsAuthVerifier>,
+) -> Router {
+    let subsystems = SubsystemStatusRegistry::new(store.clone());
+    if tokio::runtime::Handle::try_current().is_ok() {
+        subsystems.spawn_expiry_reaper(Duration::from_secs(5));
+    }
+    build_console_api_router_with_state(ConsoleApiState {
+        store,
+        ingress,
+        subsystems,
+        auth,
+    })
+}
+
+/// Builds the console router directly from a preconstructed [`ConsoleApiState`].
+pub fn build_console_api_router_with_state(state: ConsoleApiState) -> Router {
     Router::new()
         // Smartscape topology
         .route("/api/v1/smartscape", get(handle_get_smartscape))
@@ -314,6 +360,35 @@ pub fn build_console_api_router_with_ingress(
         )
         .route("/api/ingress/upstreams", get(handle_get_ingress_upstreams))
         .route("/api/v1/ingress/overview", get(handle_get_ingress_overview))
+        // Unified 7-subsystem operational status & maintenance override controls
+        .route("/api/v1/status/subsystems", get(handle_get_subsystems))
+        .route(
+            "/api/v1/console/status/subsystems",
+            get(handle_get_subsystems),
+        )
+        .route("/api/observe/status/subsystems", get(handle_get_subsystems))
+        .route("/api/status/subsystems", get(handle_get_subsystems))
+        .route("/api/obs/v1/status/subsystems", get(handle_get_subsystems))
+        .route(
+            "/api/v1/status/subsystems/{id}/maintenance",
+            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
+        )
+        .route(
+            "/api/v1/console/status/subsystems/{id}/maintenance",
+            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
+        )
+        .route(
+            "/api/observe/status/subsystems/{id}/maintenance",
+            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
+        )
+        .route(
+            "/api/status/subsystems/{id}/maintenance",
+            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
+        )
+        .route(
+            "/api/obs/v1/status/subsystems/{id}/maintenance",
+            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
+        )
         .route(
             "/api/observe/ingress/overview",
             get(handle_get_ingress_overview),
@@ -365,8 +440,13 @@ pub fn build_console_api_router_with_ingress(
 
 async fn handle_get_smartscape(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     q_res: Result<Query<SmartscapeQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let Query(params) = match q_res {
         Ok(q) => q,
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -396,8 +476,9 @@ async fn handle_get_smartscape(
 
 async fn collect_causal_problem_cards(
     store: &HotDuckDbStore,
+    subsystems: &SubsystemStatusRegistry,
     window_secs: u64,
-) -> Result<Vec<crate::analytics::causal::CausalProblemCard>, MuObserveError> {
+) -> Result<CausalMaintenanceFilterOutcome, MuObserveError> {
     let causal_problems =
         crate::analytics::causal::compute_causal_problems(store, window_secs, None)?;
 
@@ -429,6 +510,9 @@ async fn collect_causal_problem_cards(
                     burn_rate_bp: 100,
                     affected_services: vec![dp.impacted_entity],
                     ai_diagnosis: None,
+                    maintenance_suppressed: None,
+                    maintenance_subsystem: None,
+                    maintenance_state: None,
                 });
             }
         }
@@ -450,13 +534,23 @@ async fn collect_causal_problem_cards(
         p.ai_diagnosis = Some(ai);
     }
 
-    Ok(all_problems)
+    let active_maintenance = subsystems.active_maintenance_windows(None);
+    Ok(apply_maintenance_policy_to_causal_cards(
+        all_problems,
+        &active_maintenance,
+    ))
 }
 
 async fn handle_get_problems(
     State(store): State<HotDuckDbStore>,
+    State(subsystems): State<Arc<SubsystemStatusRegistry>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     q_res: Result<Query<SmartscapeQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let Query(params) = match q_res {
         Ok(q) => q,
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -472,25 +566,39 @@ async fn handle_get_problems(
         None => DEFAULT_SMARTSCAPE_WINDOW_SECS,
     };
 
-    let all_problems = match collect_causal_problem_cards(&store, window_secs).await {
+    let outcome = match collect_causal_problem_cards(&store, &subsystems, window_secs).await {
         Ok(p) => p,
         Err(e) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
+    let open_count = outcome.active_problems.len();
     let resp = crate::analytics::causal::CausalProblemsFeedResponse {
         window_secs,
-        open_count: all_problems.len(),
-        total: all_problems.len(),
-        problems: all_problems,
+        open_count,
+        total: open_count,
+        suppressed_count: outcome.suppressed_problems.len(),
+        active_maintenance_subsystems: outcome.active_maintenance_subsystems,
+        suppressed_problems: outcome.suppressed_problems,
+        problems: outcome.active_problems,
     };
 
     no_store_json(StatusCode::OK, &resp)
 }
 
-async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> Response {
-    let initial_problems = collect_causal_problem_cards(&store, DEFAULT_SMARTSCAPE_WINDOW_SECS)
-        .await
-        .unwrap_or_default();
+async fn handle_get_problem_events_sse(
+    State(store): State<HotDuckDbStore>,
+    State(subsystems): State<Arc<SubsystemStatusRegistry>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
+    let initial_problems =
+        collect_causal_problem_cards(&store, &subsystems, DEFAULT_SMARTSCAPE_WINDOW_SECS)
+            .await
+            .map(|o| o.active_problems)
+            .unwrap_or_default();
 
     let mut initial_events = VecDeque::new();
     for card in &initial_problems {
@@ -520,6 +628,8 @@ async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> R
                         Ok(msg) => {
                             let ev_name = if msg.contains("\"log_entry\"") {
                                 "log_entry"
+                            } else if msg.contains("\"subsystem_status_changed\"") {
+                                "subsystem_status_changed"
                             } else if msg.contains("\"problem_id\"") {
                                 "problem_opened"
                             } else if msg.contains("\"ingress\"") {
@@ -550,17 +660,136 @@ async fn handle_get_problem_events_sse(State(store): State<HotDuckDbStore>) -> R
         .into_response()
 }
 
-async fn handle_get_ingress_routes(State(engine): State<Arc<IngressEngine>>) -> Response {
+async fn handle_get_subsystems(
+    State(subsystems): State<Arc<SubsystemStatusRegistry>>,
+    State(engine): State<Arc<IngressEngine>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    let ctx = match authorize_http_request(&*auth, &headers, ObsPermission::SystemStatusRead) {
+        Ok(ctx) => ctx,
+        Err(resp) => return *resp,
+    };
+    let upstreams = engine.get_upstream_dtos().await;
+    let anonymous_redacted = !ctx.can_read_full_observability();
+    let snap = subsystems.snapshot(&upstreams, anonymous_redacted, None);
+    no_store_json(StatusCode::OK, &snap)
+}
+
+async fn execute_subsystem_maintenance_command(
+    subsystems: &SubsystemStatusRegistry,
+    engine: &IngressEngine,
+    auth: &dyn ObsAuthVerifier,
+    headers: &HeaderMap,
+    subsystem_id: &str,
+    build_cmd: impl FnOnce(Option<String>) -> Result<MaintenanceCommand, (StatusCode, String)>,
+) -> Response {
+    let auth_ctx =
+        match authorize_http_request(auth, headers, ObsPermission::PlatformMaintenanceWrite) {
+            Ok(ctx) => ctx,
+            Err(resp) => return *resp,
+        };
+
+    let Some(subsystem) = PlatformSubsystemId::from_str_id(subsystem_id) else {
+        return json_error_response(
+            StatusCode::NOT_FOUND,
+            &format!("Unknown platform subsystem '{subsystem_id}'"),
+        );
+    };
+
+    let cmd = match build_cmd(auth_ctx.subject) {
+        Ok(c) => c,
+        Err((status, msg)) => return json_error_response(status, &msg),
+    };
+
+    let upstreams = engine.get_upstream_dtos().await;
+    let (dto, _ev) = subsystems.apply_maintenance_command(subsystem, cmd, &upstreams, None);
+    no_store_json(StatusCode::OK, &dto)
+}
+
+async fn handle_put_subsystem_maintenance(
+    State(subsystems): State<Arc<SubsystemStatusRegistry>>,
+    State(engine): State<Arc<IngressEngine>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+    AxumPath(subsystem_id): AxumPath<String>,
+    payload_res: Result<Json<SubsystemMaintenanceRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    execute_subsystem_maintenance_command(
+        &subsystems,
+        &engine,
+        &*auth,
+        &headers,
+        &subsystem_id,
+        move |subject| {
+            let Json(mut payload) =
+                payload_res.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+            if payload.actor.is_none() {
+                payload.actor = subject;
+            }
+            payload
+                .validate()
+                .map_err(|msg| (StatusCode::BAD_REQUEST, msg.to_string()))
+        },
+    )
+    .await
+}
+
+async fn handle_delete_subsystem_maintenance(
+    State(subsystems): State<Arc<SubsystemStatusRegistry>>,
+    State(engine): State<Arc<IngressEngine>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+    AxumPath(subsystem_id): AxumPath<String>,
+) -> Response {
+    execute_subsystem_maintenance_command(
+        &subsystems,
+        &engine,
+        &*auth,
+        &headers,
+        &subsystem_id,
+        |subject| {
+            Ok(MaintenanceCommand::ClearToAuto {
+                actor: subject,
+                reason: None,
+            })
+        },
+    )
+    .await
+}
+
+async fn handle_get_ingress_routes(
+    State(engine): State<Arc<IngressEngine>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let routes = engine.get_route_dtos().await;
     no_store_json(StatusCode::OK, &routes)
 }
 
-async fn handle_get_ingress_upstreams(State(engine): State<Arc<IngressEngine>>) -> Response {
+async fn handle_get_ingress_upstreams(
+    State(engine): State<Arc<IngressEngine>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let upstreams = engine.get_upstream_dtos().await;
     no_store_json(StatusCode::OK, &upstreams)
 }
 
-async fn handle_get_ingress_overview(State(engine): State<Arc<IngressEngine>>) -> Response {
+async fn handle_get_ingress_overview(
+    State(engine): State<Arc<IngressEngine>>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let overview = engine.get_overview_dto().await;
     no_store_json(StatusCode::OK, &overview)
 }
@@ -685,47 +914,14 @@ fn validate_upstream_url_ssrf(url_str: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn validate_admin_auth(headers: &axum::http::HeaderMap) -> Option<&'static str> {
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-
-    let token = auth_header
-        .and_then(|val| {
-            val.strip_prefix("Bearer ")
-                .or_else(|| val.strip_prefix("bearer "))
-        })
-        .map(str::trim);
-
-    let expected = crate::ingress::non_empty_env("MUOBSERVE_INGRESS_ADMIN_TOKEN")
-        .or_else(|| crate::ingress::non_empty_env("MUOBSERVE_OPERATOR_TOKEN"))
-        .or_else(|| crate::ingress::non_empty_env("MUOBSERVE_BEARER_TOKEN"));
-
-    match (token, expected) {
-        (Some(presented), Some(exp)) if !presented.is_empty() => {
-            if crate::ingress::constant_time_eq(presented.as_bytes(), exp.as_bytes()) {
-                None
-            } else {
-                Some("Unauthorized: invalid Ingress admin Bearer token")
-            }
-        }
-        _ => Some("Unauthorized: Ingress admin Bearer token required"),
-    }
-}
-
 async fn handle_post_ingress_route(
     State(engine): State<Arc<IngressEngine>>,
-    headers: axum::http::HeaderMap,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     Json(payload): Json<IngressRouteCreateRequest>,
 ) -> Response {
-    if let Some(err_msg) = validate_admin_auth(&headers) {
-        return no_store_json(
-            StatusCode::UNAUTHORIZED,
-            &json!({
-                "error": err_msg,
-                "status": 401
-            }),
-        );
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressWrite) {
+        return *resp;
     }
 
     if let Err(ssrf_err) = validate_upstream_url_ssrf(&payload.upstream_url) {
@@ -767,17 +963,12 @@ async fn handle_post_ingress_route(
 
 async fn handle_post_ingress_tls(
     State(engine): State<Arc<IngressEngine>>,
-    headers: axum::http::HeaderMap,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     Json(payload): Json<crate::ingress::TlsHealthDto>,
 ) -> Response {
-    if let Some(err_msg) = validate_admin_auth(&headers) {
-        return no_store_json(
-            StatusCode::UNAUTHORIZED,
-            &json!({
-                "error": err_msg,
-                "status": 401
-            }),
-        );
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::IngressWrite) {
+        return *resp;
     }
 
     engine.set_tls_health(payload).await;
@@ -1023,8 +1214,13 @@ pub struct LogHistogramBucket {
 
 async fn handle_get_log_facets(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     q_res: Result<Query<LogFacetsParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let Query(params) = match q_res {
         Ok(q) => q,
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -1133,8 +1329,13 @@ async fn handle_get_log_facets(
 
 async fn handle_get_traces(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     q_res: Result<Query<TraceListQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let Query(params) = match q_res {
         Ok(q) => q,
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -1200,8 +1401,13 @@ async fn handle_get_traces(
 
 async fn handle_get_trace_purepath(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     AxumPath(trace_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     if let Err(msg) = validate_safe_filter_token(&trace_id) {
         return json_error_response(StatusCode::BAD_REQUEST, msg);
     }
@@ -1218,8 +1424,13 @@ async fn handle_get_trace_purepath(
 
 async fn handle_get_logs(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     q_res: Result<Query<LogsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let Query(params) = match q_res {
         Ok(q) => q,
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -1289,8 +1500,13 @@ async fn handle_get_logs(
 
 async fn handle_get_job_log(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     AxumPath(job_id): AxumPath<String>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     if let Err(msg) = validate_safe_filter_token(&job_id) {
         return json_error_response(StatusCode::BAD_REQUEST, msg);
     }
@@ -1563,8 +1779,13 @@ pub fn query_sanitized_job_log(
 
 async fn handle_get_metrics(
     State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
     q_res: Result<Query<MetricsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     let Query(params) = match q_res {
         Ok(q) => q,
         Err(e) => return json_error_response(StatusCode::BAD_REQUEST, &e.to_string()),
@@ -1770,7 +1991,14 @@ pub fn query_sanitized_metrics(
     })
 }
 
-async fn handle_get_store_status(State(store): State<HotDuckDbStore>) -> Response {
+async fn handle_get_store_status(
+    State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ObservabilityRead) {
+        return *resp;
+    }
     match collect_storage_health_status(&store) {
         Ok(status) => no_store_json(StatusCode::OK, &status),
         Err(e) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
