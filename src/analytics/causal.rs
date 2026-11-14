@@ -40,6 +40,12 @@ pub struct CausalProblemCard {
     pub affected_services: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_diagnosis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_suppressed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_subsystem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_state: Option<String>,
 }
 
 /// Problems feed response matching API contracts.
@@ -48,6 +54,12 @@ pub struct CausalProblemsFeedResponse {
     pub window_secs: u64,
     pub open_count: usize,
     pub total: usize,
+    #[serde(default)]
+    pub suppressed_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_maintenance_subsystems: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed_problems: Vec<CausalProblemCard>,
     pub problems: Vec<CausalProblemCard>,
 }
 
@@ -357,6 +369,9 @@ pub fn compute_causal_problems(
                 burn_rate_bp,
                 affected_services: vec![service_name.clone()],
                 ai_diagnosis,
+                maintenance_suppressed: None,
+                maintenance_subsystem: None,
+                maintenance_state: None,
             };
 
             let key = (root_service, Some(trace_id));

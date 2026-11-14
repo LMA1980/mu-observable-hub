@@ -1,13 +1,20 @@
+pub mod auth;
 pub mod console_api;
 pub mod mtls_ingest;
 pub mod sanitize;
+pub mod subsystem_status;
 
+pub use auth::{
+    authorize_http_request, AuthContext, AuthRejection, MuAuthFolioVerifier, ObsAuthVerifier,
+    ObsPermission,
+};
 pub use console_api::{
-    build_console_api_router, build_console_api_router_with_ingress, collect_storage_health_status,
-    query_sanitized_job_log, query_sanitized_logs, query_sanitized_logs_with_job,
-    query_sanitized_logs_with_token, query_sanitized_metrics, ClusterEfficiencyItem,
-    ConsoleApiState, ConsoleLogItem, LogsQueryResponse, MetricTimeseriesPoint,
-    MetricsTimeseriesResponse, SanitizedLogRecord, StoreStatusResponse,
+    build_console_api_router, build_console_api_router_with_auth,
+    build_console_api_router_with_ingress, build_console_api_router_with_state,
+    collect_storage_health_status, query_sanitized_job_log, query_sanitized_logs,
+    query_sanitized_logs_with_job, query_sanitized_logs_with_token, query_sanitized_metrics,
+    ClusterEfficiencyItem, ConsoleApiState, ConsoleLogItem, LogsQueryResponse,
+    MetricTimeseriesPoint, MetricsTimeseriesResponse, SanitizedLogRecord, StoreStatusResponse,
 };
 pub use mtls_ingest::{
     build_mtls_server_config, build_sandbox_execution_plan, dispatch_frame, extract_cert_sans,
@@ -18,4 +25,11 @@ pub use sanitize::{
     alias_internal_hostnames, anonymize_ipv4_rfc5737, fqdn_to_shortname, mask_ipv4_third_octet,
     sanitize_console_value, scrub_host_paths, scrub_secrets_and_tokens,
     trim_path_last_two_segments, PrivacyRedactor,
+};
+pub use subsystem_status::{
+    apply_maintenance_policy_to_causal_cards, apply_maintenance_policy_to_deterministic_feed,
+    classify_problem_subsystem, classify_service_subsystem, CausalMaintenanceFilterOutcome,
+    MaintenanceCommand, PlatformSubsystemId, SubsystemHealthState, SubsystemMaintenanceRequest,
+    SubsystemOverrideMode, SubsystemStatusChangedEvent, SubsystemStatusDto,
+    SubsystemStatusRegistry, SubsystemsStatusResponse, MAX_MAINTENANCE_DURATION_SECS,
 };
