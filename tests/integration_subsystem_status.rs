@@ -10,9 +10,10 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use mu_auth::{RoleLeases, HEADER_FORWARDED_USER, HEADER_PROXY_SECRET};
 use mu_observable_hub::{
-    build_console_api_router, build_console_api_router_with_auth, CausalProblemsFeedResponse,
-    HotDuckDbStore, IngressEngine, MuAuthFolioVerifier, ObsAuthVerifier, PlatformSubsystemId,
-    SubsystemHealthState, SubsystemMaintenanceRequest, SubsystemOverrideMode, SubsystemStatusDto,
+    build_console_api_router, build_console_api_router_with_auth, AuthContext, AuthRejection,
+    CausalProblemsFeedResponse, HotDuckDbStore, IngressEngine, MuAuthFolioVerifier,
+    ObsAuthVerifier, ObsPermission, PlatformSubsystemId, SubsystemHealthState,
+    SubsystemMaintenanceRequest, SubsystemOverrideMode, SubsystemStatusDto,
     SubsystemStatusRegistry, SubsystemsStatusResponse,
 };
 use mu_observable_ipc::OtelSpanEntry;
@@ -969,4 +970,287 @@ async fn test_ingress_proxy_request_mu_auth_edge_and_spoofing() {
         Some(v) => std::env::set_var("MUOBSERVE_PROXY_SECRET", v),
         None => std::env::remove_var("MUOBSERVE_PROXY_SECRET"),
     }
+}
+
+#[tokio::test]
+async fn test_sse_obs_events_folio_authorization_and_per_event_filtering() {
+    use chrono::Utc;
+    use mu_observable_ipc::OtelLogEntry;
+
+    // Seed an active SLO problem and a store so `problem_opened` would emit if permitted.
+    let now_ts = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    seed_problem_span(&store, "trace-sse-prob-1", "muconde-controller", now_ts);
+    let ingress = IngressEngine::new(store.clone(), "node-a".into());
+
+    // 1. `locked_down`: anonymous caller has zero folios -> 401 Unauthorized on GET /api/obs/v1/events
+    let locked_verifier: Arc<dyn ObsAuthVerifier> =
+        Arc::new(MuAuthFolioVerifier::locked_down(Some("edge-secret-sse")));
+    let locked_router =
+        build_console_api_router_with_auth(store.clone(), ingress.clone(), locked_verifier);
+    let locked_resp = locked_router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(locked_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        locked_resp
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert!(locked_resp.headers().contains_key("www-authenticate"));
+
+    // 2. `public_status_only` + authenticated `platform-admin`-only principal
+    let verifier = Arc::new(MuAuthFolioVerifier::public_status_only(Some(
+        "edge-secret-sse",
+    )));
+    verifier.bind_principal("plat-only", 1, &["platform-admin"], RoleLeases::default());
+    verifier
+        .activate_timed_role("plat-only", "platform-admin", true, epoch_ms_now())
+        .expect("timed lease activated");
+    let auth: Arc<dyn ObsAuthVerifier> = verifier;
+    let router = build_console_api_router_with_auth(store.clone(), ingress, auth);
+
+    // 2a. Anonymous `public_status_only` -> 200 OK text/event-stream; omits `problem_opened` & `log_entry`;
+    // redacts `subsystem_status_changed` summary.
+    let anon_sse = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anon_sse.status(), StatusCode::OK);
+    let mut anon_body = anon_sse.into_body();
+
+    // 2b. Authenticated principal with `viewer` baseline + `platform-admin` -> 200 OK text/event-stream;
+    // receives initial `problem_opened`, live `log_entry`, and unredacted `subsystem_status_changed`.
+    let plat_sse = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/events")
+                .header(HEADER_PROXY_SECRET, "edge-secret-sse")
+                .header(HEADER_FORWARDED_USER, "plat-only")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plat_sse.status(), StatusCode::OK);
+    let mut plat_body = plat_sse.into_body();
+
+    // Give spawned/initial stream tasks a tick, then emit a `log_entry` (delivered only to `plat_body`,
+    // omitted for `anon_body`) followed by a maintenance change (delivered to both, redacted only for anon).
+    tokio::task::yield_now().await;
+    store
+        .insert_logs(&[OtelLogEntry {
+            timestamp_unix_nano: now_ts,
+            trace_id: "trace-sse-log-1".into(),
+            span_id: "span-sse-log-1".into(),
+            severity_number: 9,
+            severity_text: "INFO".into(),
+            service_name: "actionrunner-controller".into(),
+            node_id: "node-a".into(),
+            body: "secret internal log message".into(),
+            attributes_json: "{}".into(),
+            job_id: None,
+            stage_id: None,
+        }])
+        .expect("insert log");
+
+    let put_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/obs/v1/status/subsystems/ci/maintenance")
+                .header(HEADER_PROXY_SECRET, "edge-secret-sse")
+                .header(HEADER_FORWARDED_USER, "plat-only")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "state": "in-maintenance",
+                        "summary": "Operator window internal note for ci maintenance"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    let anon_frame = tokio::time::timeout(Duration::from_secs(2), anon_body.frame())
+        .await
+        .expect("anon SSE frame timeout")
+        .expect("anon SSE stream open")
+        .expect("anon SSE chunk ok");
+    let anon_text = String::from_utf8_lossy(anon_frame.data_ref().expect("data bytes")).to_string();
+    assert!(
+        anon_text.contains("event: subsystem_status_changed"),
+        "expected subsystem_status_changed frame, got: {anon_text}"
+    );
+    assert!(
+        anon_text.contains("Scheduled maintenance in progress"),
+        "expected redacted generic summary, got: {anon_text}"
+    );
+    assert!(
+        !anon_text.contains("Operator window internal note"),
+        "anonymous stream leaked raw operator summary: {anon_text}"
+    );
+    assert!(
+        !anon_text.contains("problem_opened") && !anon_text.contains("log_entry"),
+        "anonymous status-only stream leaked restricted events: {anon_text}"
+    );
+
+    let mut plat_frames = Vec::with_capacity(3);
+    for idx in 0..3 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), plat_body.frame())
+            .await
+            .unwrap_or_else(|_| panic!("plat SSE frame {idx} timeout"))
+            .expect("plat SSE stream open")
+            .expect("plat SSE chunk ok");
+        plat_frames
+            .push(String::from_utf8_lossy(frame.data_ref().expect("data bytes")).to_string());
+    }
+    assert!(
+        plat_frames[0].contains("event: problem_opened")
+            && plat_frames[0].contains("PROB-CAUSAL-muconde-controller-muconde-controller"),
+        "expected initial problem_opened frame, got: {}",
+        plat_frames[0]
+    );
+    assert!(
+        plat_frames[1].contains("event: log_entry")
+            && plat_frames[1].contains("secret internal log message"),
+        "expected live log_entry frame, got: {}",
+        plat_frames[1]
+    );
+    assert!(
+        plat_frames[2].contains("event: subsystem_status_changed")
+            && plat_frames[2].contains("Operator window internal note for ci maintenance"),
+        "expected unredacted subsystem_status_changed frame, got: {}",
+        plat_frames[2]
+    );
+
+    // 3. Authenticated principal with ONLY `system:status.read` + `platform:maintenance.*`
+    // (no `obs:problems.read` or `obs:logs.read`) -> `authorize_http_any_read` falls through cleanly
+    // and SSE delivers unredacted `subsystem_status_changed` while omitting `problem_opened` and `log_entry`.
+    struct PlatformStatusOnlyVerifier;
+
+    impl ObsAuthVerifier for PlatformStatusOnlyVerifier {
+        fn authorize(
+            &self,
+            _headers: &axum::http::HeaderMap,
+            permission: ObsPermission,
+        ) -> Result<AuthContext, AuthRejection> {
+            const GRANTED: [&str; 3] = [
+                "system:status.read",
+                "platform:maintenance.read",
+                "platform:maintenance.write",
+            ];
+            if !GRANTED.contains(&permission.as_str()) {
+                return Err(AuthRejection {
+                    message: "Unauthorized: missing required folio",
+                    realm: "mu-observe",
+                });
+            }
+            Ok(AuthContext {
+                authenticated: true,
+                is_anonymous: false,
+                subject: Some("plat-status-only".into()),
+                folios: vec!["folio:system:status".into(), "folio:platform:admin".into()],
+                granted_policies: GRANTED.iter().map(|s| (*s).to_string()).collect(),
+            })
+        }
+    }
+
+    let plat_only_router = build_console_api_router_with_auth(
+        store.clone(),
+        IngressEngine::new(store.clone(), "node-a".into()),
+        Arc::new(PlatformStatusOnlyVerifier),
+    );
+    let plat_only_sse = plat_only_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plat_only_sse.status(), StatusCode::OK);
+    let mut plat_only_body = plat_only_sse.into_body();
+
+    tokio::task::yield_now().await;
+    store
+        .insert_logs(&[OtelLogEntry {
+            timestamp_unix_nano: now_ts + 1_000_000,
+            trace_id: "trace-sse-log-2".into(),
+            span_id: "span-sse-log-2".into(),
+            severity_number: 9,
+            severity_text: "INFO".into(),
+            service_name: "actionrunner-controller".into(),
+            node_id: "node-a".into(),
+            body: "secret internal log message 2".into(),
+            attributes_json: "{}".into(),
+            job_id: None,
+            stage_id: None,
+        }])
+        .expect("insert second log");
+
+    let plat_only_put = plat_only_router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/obs/v1/status/subsystems/ci/maintenance")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "state": "in-maintenance",
+                        "summary": "Operator window internal note for ci maintenance"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plat_only_put.status(), StatusCode::OK);
+
+    let plat_only_frame = tokio::time::timeout(Duration::from_secs(2), plat_only_body.frame())
+        .await
+        .expect("plat-only SSE frame timeout")
+        .expect("plat-only SSE stream open")
+        .expect("plat-only SSE chunk ok");
+    let plat_only_text =
+        String::from_utf8_lossy(plat_only_frame.data_ref().expect("data bytes")).to_string();
+    assert!(
+        plat_only_text.contains("event: subsystem_status_changed"),
+        "expected subsystem_status_changed frame, got: {plat_only_text}"
+    );
+    assert!(
+        plat_only_text.contains("Operator window internal note for ci maintenance"),
+        "platform status-only caller should receive unredacted summary, got: {plat_only_text}"
+    );
+    assert!(
+        !plat_only_text.contains("problem_opened") && !plat_only_text.contains("log_entry"),
+        "platform status-only stream leaked obs:problems/logs events: {plat_only_text}"
+    );
 }
