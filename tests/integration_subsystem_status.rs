@@ -1254,3 +1254,31 @@ async fn test_sse_obs_events_folio_authorization_and_per_event_filtering() {
         "platform status-only stream leaked obs:problems/logs events: {plat_only_text}"
     );
 }
+
+#[tokio::test]
+async fn test_mcp_server_router_with_ingress_serves_mcp_and_console_without_overlap() {
+    let _guard = ENV_LOCK.lock().await;
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let ingress = IngressEngine::new(store.clone(), "node-a".to_string());
+    let app = mu_observable_hub::mcp::McpServer::new(store).router_with_ingress(ingress);
+
+    for path in [
+        "/mcp/sse",
+        "/api/obs/v1/status/subsystems",
+        "/api/v1/ingress/overview",
+        "/api/obs/v1/events",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("GET endpoint");
+        assert_eq!(resp.status(), StatusCode::OK, "path={path}");
+    }
+}
