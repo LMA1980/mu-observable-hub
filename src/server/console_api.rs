@@ -26,12 +26,14 @@ use crate::analytics::smartscape::{
 use crate::error::MuObserveError;
 use crate::ingress::{IngressEngine, UpstreamHealthChecker};
 use crate::server::auth::{
-    authorize_http_request, MuAuthFolioVerifier, ObsAuthVerifier, ObsPermission,
+    authorize_http_any_read, authorize_http_request, MuAuthFolioVerifier, ObsAuthVerifier,
+    ObsPermission,
 };
 use crate::server::sanitize::PrivacyRedactor;
 use crate::server::subsystem_status::{
     apply_maintenance_policy_to_causal_cards, CausalMaintenanceFilterOutcome, MaintenanceCommand,
-    PlatformSubsystemId, SubsystemMaintenanceRequest, SubsystemStatusRegistry,
+    PlatformSubsystemId, SubsystemMaintenanceRequest, SubsystemStatusChangedEvent,
+    SubsystemStatusRegistry,
 };
 use crate::storage::hot_duckdb::HotDuckDbStore;
 use crate::DEFAULT_HOT_RETENTION_DAYS;
@@ -591,19 +593,40 @@ async fn handle_get_problem_events_sse(
     State(auth): State<Arc<dyn ObsAuthVerifier>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = authorize_http_request(&*auth, &headers, ObsPermission::ProblemsRead) {
-        return *resp;
-    }
-    let initial_problems =
-        collect_causal_problem_cards(&store, &subsystems, DEFAULT_SMARTSCAPE_WINDOW_SECS)
-            .await
-            .map(|o| o.active_problems)
-            .unwrap_or_default();
+    let ctx = match authorize_http_any_read(
+        &*auth,
+        &headers,
+        &[
+            ObsPermission::ProblemsRead,
+            ObsPermission::SystemStatusRead,
+            ObsPermission::PlatformMaintenanceRead,
+            ObsPermission::LogsRead,
+            ObsPermission::IngressRead,
+        ],
+    ) {
+        Ok(ctx) => ctx,
+        Err(resp) => return *resp,
+    };
+
+    let can_problems = ctx.has_policy(ObsPermission::ProblemsRead.as_str());
+    let can_logs = ctx.has_policy(ObsPermission::LogsRead.as_str());
+    let can_ingress = ctx.has_policy(ObsPermission::IngressRead.as_str());
+    let can_status = ctx.has_policy(ObsPermission::SystemStatusRead.as_str())
+        || ctx.has_policy(ObsPermission::PlatformMaintenanceRead.as_str());
+    let redact_status_summary = !ctx.can_read_full_observability();
 
     let mut initial_events = VecDeque::new();
-    for card in &initial_problems {
-        if let Ok(json_line) = serde_json::to_string(card) {
-            initial_events.push_back(json_line);
+    if can_problems {
+        let initial_problems =
+            collect_causal_problem_cards(&store, &subsystems, DEFAULT_SMARTSCAPE_WINDOW_SECS)
+                .await
+                .map(|o| o.active_problems)
+                .unwrap_or_default();
+
+        for card in &initial_problems {
+            if let Ok(json_line) = serde_json::to_string(card) {
+                initial_events.push_back(json_line);
+            }
         }
     }
 
@@ -622,34 +645,66 @@ async fn handle_get_problem_events_sse(
                 ));
             }
 
-            tokio::select! {
-                recv_res = rx.recv() => {
-                    match recv_res {
-                        Ok(msg) => {
-                            let ev_name = if msg.contains("\"log_entry\"") {
-                                "log_entry"
-                            } else if msg.contains("\"subsystem_status_changed\"") {
-                                "subsystem_status_changed"
-                            } else if msg.contains("\"problem_id\"") {
-                                "problem_opened"
-                            } else if msg.contains("\"ingress\"") {
-                                "ingress_changed"
-                            } else {
-                                "message"
-                            };
-                            let ev = Event::default().event(ev_name).data(msg);
-                            Some((Ok(ev), (rx, ticker, initial)))
+            loop {
+                tokio::select! {
+                    recv_res = rx.recv() => {
+                        match recv_res {
+                            Ok(msg) => {
+                                if msg.contains("\"log_entry\"") {
+                                    if !can_logs {
+                                        continue;
+                                    }
+                                    let ev = Event::default().event("log_entry").data(msg);
+                                    return Some((Ok(ev), (rx, ticker, initial)));
+                                } else if msg.contains("\"subsystem_status_changed\"") {
+                                    if !can_status {
+                                        continue;
+                                    }
+                                    let payload = if redact_status_summary {
+                                        let Ok(mut ev_dto) = serde_json::from_str::<SubsystemStatusChangedEvent>(&msg) else {
+                                            continue;
+                                        };
+                                        ev_dto.summary = ev_dto.state.anonymous_generic_summary().to_string();
+                                        let Ok(redacted_json) = serde_json::to_string(&ev_dto) else {
+                                            continue;
+                                        };
+                                        redacted_json
+                                    } else {
+                                        msg
+                                    };
+                                    let ev = Event::default().event("subsystem_status_changed").data(payload);
+                                    return Some((Ok(ev), (rx, ticker, initial)));
+                                } else if msg.contains("\"problem_id\"") {
+                                    if !can_problems {
+                                        continue;
+                                    }
+                                    let ev = Event::default().event("problem_opened").data(msg);
+                                    return Some((Ok(ev), (rx, ticker, initial)));
+                                } else if msg.contains("\"ingress\"") {
+                                    if !can_ingress {
+                                        continue;
+                                    }
+                                    let ev = Event::default().event("ingress_changed").data(msg);
+                                    return Some((Ok(ev), (rx, ticker, initial)));
+                                } else {
+                                    if !can_problems {
+                                        continue;
+                                    }
+                                    let ev = Event::default().event("message").data(msg);
+                                    return Some((Ok(ev), (rx, ticker, initial)));
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
+                                return Some((Ok(ev), (rx, ticker, initial)));
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
-                            Some((Ok(ev), (rx, ticker, initial)))
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
                     }
-                }
-                _ = ticker.tick() => {
-                    let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
-                    Some((Ok(ev), (rx, ticker, initial)))
+                    _ = ticker.tick() => {
+                        let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
+                        return Some((Ok(ev), (rx, ticker, initial)));
+                    }
                 }
             }
         },

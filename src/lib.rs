@@ -37,8 +37,8 @@ pub use error::{MuObserveError, StorageError};
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, MCP_TOOL_NAMES};
 pub use server::{
     alias_internal_hostnames, anonymize_ipv4_rfc5737, apply_maintenance_policy_to_causal_cards,
-    apply_maintenance_policy_to_deterministic_feed, authorize_http_request,
-    build_console_api_router, build_console_api_router_with_auth,
+    apply_maintenance_policy_to_deterministic_feed, authorize_http_any_read,
+    authorize_http_request, build_console_api_router, build_console_api_router_with_auth,
     build_console_api_router_with_ingress, build_console_api_router_with_state,
     build_mtls_server_config, build_sandbox_execution_plan, classify_problem_subsystem,
     classify_service_subsystem, collect_storage_health_status, dispatch_frame, extract_cert_sans,

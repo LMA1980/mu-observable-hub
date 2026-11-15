@@ -780,15 +780,29 @@ impl McpServer {
         Ok(())
     }
 
-    /// Builds an Axum HTTP/SSE router exposing `POST /mcp` (JSON-RPC), `GET /mcp/sse` (SSE endpoint discovery),
-    /// and the read-only M6 observability console API (`/api/v1/*`, `/api/v1/console/*`, `/api/observe/*`).
-    pub fn router(self) -> Router {
-        let store = self.store.clone();
+    /// Builds an Axum router exposing only `POST /mcp` (JSON-RPC) and `GET /mcp/sse` (SSE endpoint discovery).
+    pub fn mcp_only_router(self) -> Router {
         Router::new()
             .route("/mcp", post(http_mcp_post_handler))
             .route("/mcp/sse", get(http_mcp_sse_handler))
             .with_state(self)
+    }
+
+    /// Builds an Axum HTTP/SSE router exposing `POST /mcp` (JSON-RPC), `GET /mcp/sse` (SSE endpoint discovery),
+    /// and the M6 observability console API (`/api/v1/*`, `/api/v1/console/*`, `/api/obs/v1/*`, `/api/observe/*`).
+    pub fn router(self) -> Router {
+        let store = self.store.clone();
+        self.mcp_only_router()
             .merge(crate::server::build_console_api_router(store))
+    }
+
+    /// Builds the combined MCP and observability console HTTP/SSE router backed by a shared `IngressEngine`.
+    pub fn router_with_ingress(self, ingress: std::sync::Arc<crate::IngressEngine>) -> Router {
+        let store = self.store.clone();
+        self.mcp_only_router()
+            .merge(crate::server::build_console_api_router_with_ingress(
+                store, ingress,
+            ))
     }
 }
 

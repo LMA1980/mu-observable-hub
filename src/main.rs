@@ -59,17 +59,11 @@ async fn main() {
             std::time::Duration::from_secs(10),
         );
         let ingress_for_server = ingress_engine.clone();
-        let console_store = store.clone();
 
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(&mcp_http_addr).await {
                 tracing::info!(%mcp_http_addr, "MuObserve MCP HTTP/SSE & Ingress server listening");
-                let router = McpServer::new(mcp_store).router().merge(
-                    mu_observable_hub::server::build_console_api_router_with_ingress(
-                        console_store,
-                        ingress_for_server,
-                    ),
-                );
+                let router = McpServer::new(mcp_store).router_with_ingress(ingress_for_server);
                 let _ = axum::serve(listener, router).await;
             }
         });

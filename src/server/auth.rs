@@ -662,6 +662,42 @@ pub fn authorize_http_request(
     })
 }
 
+/// Evaluates an HTTP request against `verifier` across a set of read `permissions`,
+/// returning the first matching [`AuthContext`] or a fail-closed `401` response.
+pub fn authorize_http_any_read(
+    verifier: &dyn ObsAuthVerifier,
+    headers: &HeaderMap,
+    permissions: &[ObsPermission],
+) -> Result<AuthContext, Box<Response>> {
+    let mut last_err: Option<Box<Response>> = None;
+    for &perm in permissions {
+        if perm.is_write_permission() {
+            continue;
+        }
+        match authorize_http_request(verifier, headers, perm) {
+            Ok(ctx) => return Ok(ctx),
+            Err(resp) => last_err = Some(resp),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        authorize_http_request(verifier, headers, ObsPermission::ProblemsRead)
+            .err()
+            .unwrap_or_else(|| {
+                Box::new(
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(header::CACHE_CONTROL, "no-store".to_string())],
+                        Json(json!({
+                            "error": "Unauthorized: missing required read mu-auth folio",
+                            "status": 401,
+                        })),
+                    )
+                        .into_response(),
+                )
+            })
+    }))
+}
+
 /// Extracts a trimmed `Bearer <token>` credential from an HTTP header map.
 pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
