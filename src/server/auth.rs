@@ -9,9 +9,10 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mu_auth::{
-    constant_time_str_eq, evaluate_session, resolve_secret_value, resolve_secret_with_file_var,
-    EdgeAuthConfig, FolioCatalog, FolioError, FolioId, GithubEdgeAuthAdapter, Principal,
-    RoleCatalog, RoleFolioIndex, RoleId, RoleLease, RoleLeases, RoleSpec, StepUpRequirement,
+    canonical_super_operator_folios, constant_time_str_eq, evaluate_session, resolve_secret_value,
+    resolve_secret_with_file_var, EdgeAuthConfig, FolioCatalog, FolioError, FolioId,
+    GithubEdgeAuthAdapter, Principal, RoleCatalog, RoleFolioIndex, RoleId, RoleLease, RoleLeases,
+    RoleSpec, StepUpRequirement, SUPER_OPERATOR_ROLE_ID,
 };
 use serde_json::json;
 
@@ -191,7 +192,12 @@ impl MuAuthFolioVerifier {
                 verifier.bind_principal(
                     login,
                     1,
-                    &["viewer", "ingress-admin", "platform-admin"],
+                    &[
+                        "viewer",
+                        "ingress-admin",
+                        "platform-admin",
+                        SUPER_OPERATOR_ROLE_ID,
+                    ],
                     leases,
                 );
             }
@@ -334,6 +340,45 @@ impl MuAuthFolioVerifier {
         Ok(lease.clone())
     }
 
+    /// Extends an active renewable `Timed` role lease (such as `super-operator`) within its final
+    /// renewal window after fresh Passkey step-up verification.
+    pub fn renew_timed_role(
+        &self,
+        login: &str,
+        role_id: &str,
+        step_up_verified: bool,
+        now_ms: u64,
+    ) -> Result<RoleLease, FolioError> {
+        let role = RoleId::new(role_id)?;
+        let mut guard = self.state.write().expect("auth lock");
+        let role_catalog = guard.role_catalog.clone();
+        let entry = guard
+            .principals
+            .get_mut(&login.trim().to_ascii_lowercase())
+            .ok_or_else(|| FolioError::UnauthorizedActivation {
+                role: role_id.to_string(),
+            })?;
+        let principal = Principal::Authenticated {
+            login: login.trim().to_string(),
+            passkey_count: entry.passkey_count,
+            bound_roles: entry.bound_roles.clone(),
+        };
+        let lease =
+            entry
+                .leases
+                .renew_timed(&role_catalog, &principal, &role, now_ms, step_up_verified)?;
+        Ok(lease.clone())
+    }
+
+    /// Records explicit user activity to extend active idle timers up to each lease's hard deadline.
+    pub fn record_activity(&self, login: &str, now_ms: u64) {
+        if let Ok(mut guard) = self.state.write() {
+            if let Some(entry) = guard.principals.get_mut(&login.trim().to_ascii_lowercase()) {
+                let _ = entry.leases.record_activity(now_ms);
+            }
+        }
+    }
+
     fn build_internal(
         edge_adapter: Option<GithubEdgeAuthAdapter>,
         anonymous_folios: &[&str],
@@ -344,6 +389,7 @@ impl MuAuthFolioVerifier {
         let viewer_id = RoleId::new("viewer").expect("valid role");
         let ingress_admin_id = RoleId::new("ingress-admin").expect("valid role");
         let platform_admin_id = RoleId::new("platform-admin").expect("valid role");
+        let super_operator_id = RoleId::new(SUPER_OPERATOR_ROLE_ID).expect("valid role");
 
         let role_catalog = RoleCatalog::from_roles([
             RoleSpec::pinned_baseline(
@@ -367,6 +413,7 @@ impl MuAuthFolioVerifier {
                 600,
             )
             .expect("valid platform admin role"),
+            RoleSpec::super_operator(),
         ])
         .expect("valid role catalog");
 
@@ -414,6 +461,14 @@ impl MuAuthFolioVerifier {
                 &role_catalog,
             )
             .expect("valid platform admin folios");
+        role_folio_index
+            .set_role_folios(
+                super_operator_id,
+                BTreeSet::from(canonical_super_operator_folios()),
+                &folio_catalog,
+                &role_catalog,
+            )
+            .expect("valid super-operator folios");
 
         Self {
             state: RwLock::new(PolicyEngineState {
@@ -937,5 +992,83 @@ mod tests {
         assert!(verifier
             .authorize(&ok_headers, ObsPermission::IngressWrite)
             .is_ok());
+    }
+
+    #[test]
+    fn test_super_operator_grants_all_obs_permissions_and_supports_single_last_2m_renewal() {
+        let verifier = MuAuthFolioVerifier::locked_down(Some("edge-secret-123"));
+        let t0 = 1_000_000_u64;
+        verifier.bind_principal(
+            "alice",
+            1,
+            &["viewer", SUPER_OPERATOR_ROLE_ID],
+            RoleLeases::default(),
+        );
+        let mut alice_headers = HeaderMap::new();
+        alice_headers.insert(
+            "x-proxy-secret",
+            HeaderValue::from_static("edge-secret-123"),
+        );
+        alice_headers.insert("x-forwarded-user", HeaderValue::from_static("alice"));
+
+        // Activation requires Passkey step-up confirmation.
+        assert!(matches!(
+            verifier.activate_timed_role("alice", SUPER_OPERATOR_ROLE_ID, false, t0),
+            Err(FolioError::StepUpRequired { .. })
+        ));
+        let initial = verifier
+            .activate_timed_role("alice", SUPER_OPERATOR_ROLE_ID, true, t0)
+            .expect("passkey activates super-operator");
+        assert_eq!(initial.hard_expires_at_ms, t0 + 900_000);
+        assert_eq!(initial.idle_expires_at_ms, t0 + 120_000);
+
+        assert!(verifier
+            .evaluate_at(&alice_headers, ObsPermission::IngressWrite, t0 + 1_000)
+            .is_ok());
+        assert!(verifier
+            .evaluate_at(
+                &alice_headers,
+                ObsPermission::PlatformMaintenanceWrite,
+                t0 + 1_000,
+            )
+            .is_ok());
+
+        for offset in [
+            90_000, 180_000, 270_000, 360_000, 450_000, 540_000, 630_000, 720_000, 779_000,
+        ] {
+            verifier.record_activity("alice", t0 + offset);
+        }
+        assert!(matches!(
+            verifier.renew_timed_role("alice", SUPER_OPERATOR_ROLE_ID, true, t0 + 779_000),
+            Err(FolioError::RenewalWindowNotReached { .. })
+        ));
+        assert!(matches!(
+            verifier.renew_timed_role("alice", SUPER_OPERATOR_ROLE_ID, false, t0 + 780_000),
+            Err(FolioError::StepUpRequired { .. })
+        ));
+        let renewed = verifier
+            .renew_timed_role("alice", SUPER_OPERATOR_ROLE_ID, true, t0 + 780_000)
+            .expect("single last-2m Passkey renewal succeeds");
+        assert_eq!(renewed.hard_expires_at_ms, t0 + 1_800_000);
+        verifier.record_activity("alice", t0 + 880_000);
+        verifier.record_activity("alice", t0 + 920_000);
+        assert!(verifier
+            .evaluate_at(
+                &alice_headers,
+                ObsPermission::PlatformMaintenanceWrite,
+                t0 + 920_000,
+            )
+            .is_ok());
+        assert!(matches!(
+            verifier.renew_timed_role("alice", SUPER_OPERATOR_ROLE_ID, true, t0 + 920_000),
+            Err(FolioError::RenewalLimitReached { .. })
+        ));
+        assert!(verifier
+            .evaluate_at(
+                &alice_headers,
+                ObsPermission::PlatformMaintenanceWrite,
+                t0 + 1_040_000,
+            )
+            .is_err());
     }
 }

@@ -1913,7 +1913,7 @@ dependencies = [
 [[package]]
 name = "mu-auth"
 version = "0.1.0"
-source = "git+https://github.com/LMA1980/mu-auth.git?rev=b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951#b59f0d1c27ebc0d70d03dc605a80ab11c2b5b951"
+source = "git+https://github.com/LMA1980/mu-auth.git?rev=0c8970657f3e0f2f2921ee65ed754183b9e06a47#0c8970657f3e0f2f2921ee65ed754183b9e06a47"
 dependencies = [
  "hex",
  "hmac 0.12.1",
@@ -3133,7 +3133,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
