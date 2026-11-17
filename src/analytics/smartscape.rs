@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use duckdb::params;
 use serde::{Deserialize, Serialize};
 
+use crate::analytics::exclusions::MonitoringExclusions;
 use crate::analytics::regression::{
-    compute_test_flakiness, evaluate_benchmark_regressions, DEFAULT_MAX_MAD_Z_SCORE,
+    compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, DEFAULT_MAX_MAD_Z_SCORE,
 };
 use crate::error::MuObserveError;
 use crate::server::sanitize::PrivacyRedactor;
@@ -133,11 +134,25 @@ pub struct ProblemsFeedResponse {
 }
 
 /// Computes the sanitized 3-layer vertical Smartscape topology (`services`, `processes`, `hosts`,
-/// and directed `edges`) over `v_traces` and `v_metrics` within `window_secs`.
+/// and directed `edges`) over `v_traces` and `v_metrics` within `window_secs`, applying
+/// resolved [`MonitoringExclusions`].
 pub fn compute_smartscape_topology(
     store: &HotDuckDbStore,
     window_secs: u64,
     now_unix_nano: Option<i64>,
+) -> Result<SmartscapeTopology, MuObserveError> {
+    let exclusions = MonitoringExclusions::resolve(store);
+    compute_smartscape_topology_with_exclusions(store, window_secs, now_unix_nano, &exclusions)
+}
+
+/// Computes the sanitized 3-layer vertical Smartscape topology with explicit [`MonitoringExclusions`],
+/// filtering retired services and spans before `monitoring_since_unix_nano` without mutating
+/// underlying storage views.
+pub fn compute_smartscape_topology_with_exclusions(
+    store: &HotDuckDbStore,
+    window_secs: u64,
+    now_unix_nano: Option<i64>,
+    exclusions: &MonitoringExclusions,
 ) -> Result<SmartscapeTopology, MuObserveError> {
     let bounded_window = window_secs.clamp(1, 604_800);
     let redactor = PrivacyRedactor::new();
@@ -154,11 +169,12 @@ pub fn compute_smartscape_topology(
             .unwrap_or(0),
     };
 
-    let cutoff_ts = if anchor_ts > 0 {
+    let raw_cutoff = if anchor_ts > 0 {
         anchor_ts.saturating_sub((bounded_window as i64).saturating_mul(1_000_000_000))
     } else {
         0
     };
+    let cutoff_ts = exclusions.apply_cutoff_floor(raw_cutoff);
 
     #[derive(Clone)]
     struct SpanRow {
@@ -186,20 +202,30 @@ pub fn compute_smartscape_topology(
         let status: String = r.get(6)?;
         let raw_svc: String = r.get(3)?;
         let raw_node: String = r.get(4)?;
-        Ok(SpanRow {
-            trace_id: r.get(0)?,
-            span_id: r.get(1)?,
-            parent_span_id: r.get(2)?,
-            service_name: redactor.redact_str(&raw_svc),
-            node_id: redactor.redact_host(&raw_node),
-            duration_ms: (dur_ns.max(0) as f64) / 1_000_000.0,
-            is_error: status.eq_ignore_ascii_case("ERROR"),
-        })
+        let clean_svc = redactor.redact_str(&raw_svc);
+        Ok((
+            raw_svc,
+            SpanRow {
+                trace_id: r.get(0)?,
+                span_id: r.get(1)?,
+                parent_span_id: r.get(2)?,
+                service_name: clean_svc,
+                node_id: redactor.redact_host(&raw_node),
+                duration_ms: (dur_ns.max(0) as f64) / 1_000_000.0,
+                is_error: status.eq_ignore_ascii_case("ERROR"),
+            },
+        ))
     })?;
 
     let mut all_spans = Vec::new();
     for r in rows {
-        all_spans.push(r?);
+        let (raw_svc, sp) = r?;
+        if exclusions.is_service_excluded(&raw_svc)
+            || exclusions.is_service_excluded(&sp.service_name)
+        {
+            continue;
+        }
+        all_spans.push(sp);
     }
     drop(stmt);
 
@@ -459,15 +485,34 @@ pub fn compute_smartscape_topology(
 
 /// Evaluates deterministic SLO rules (latency p95 breach, error rate breach, canary taint,
 /// heartbeat staleness, benchmark regression, and flaky test spikes) and returns sanitized
-/// [`ProblemCard`] items with `root_cause_trace_id` deep-links (`M6.2`, `#33`–`#35`).
+/// [`ProblemCard`] items with `root_cause_trace_id` deep-links (`M6.2`, `#33`–`#35`),
+/// applying resolved [`MonitoringExclusions`].
 pub fn evaluate_deterministic_problems(
     store: &HotDuckDbStore,
     window_secs: u64,
     now_unix_nano: Option<i64>,
 ) -> Result<ProblemsFeedResponse, MuObserveError> {
+    let exclusions = MonitoringExclusions::resolve(store);
+    evaluate_deterministic_problems_with_exclusions(store, window_secs, now_unix_nano, &exclusions)
+}
+
+/// Evaluates deterministic SLO rules with explicit [`MonitoringExclusions`], filtering
+/// excluded `service_name`s, excluded `bench_repos` and `test_repos`, and telemetry older
+/// than `monitoring_since_unix_nano`.
+pub fn evaluate_deterministic_problems_with_exclusions(
+    store: &HotDuckDbStore,
+    window_secs: u64,
+    now_unix_nano: Option<i64>,
+    exclusions: &MonitoringExclusions,
+) -> Result<ProblemsFeedResponse, MuObserveError> {
     let bounded_window = window_secs.clamp(1, 604_800);
     let redactor = PrivacyRedactor::new();
-    let topology = compute_smartscape_topology(store, bounded_window, now_unix_nano)?;
+    let topology = compute_smartscape_topology_with_exclusions(
+        store,
+        bounded_window,
+        now_unix_nano,
+        exclusions,
+    )?;
     let conn = store.lock_conn()?;
 
     let anchor_ts: i64 = match now_unix_nano {
@@ -490,11 +535,12 @@ pub fn evaluate_deterministic_problems(
             max_span.max(max_log)
         }
     };
-    let cutoff_ts = if anchor_ts > 0 {
+    let raw_cutoff = if anchor_ts > 0 {
         anchor_ts.saturating_sub((bounded_window as i64).saturating_mul(1_000_000_000))
     } else {
         0
     };
+    let cutoff_ts = exclusions.apply_cutoff_floor(raw_cutoff);
     let detected_at_ms = if anchor_ts > 0 {
         anchor_ts / 1_000_000
     } else {
@@ -597,6 +643,11 @@ pub fn evaluate_deterministic_problems(
         }) {
             for row in rows.flatten() {
                 let clean_svc = redactor.redact_str(&row.0);
+                if exclusions.is_service_excluded(&row.0)
+                    || exclusions.is_service_excluded(&clean_svc)
+                {
+                    continue;
+                }
                 seen_canary_svcs
                     .entry(clean_svc)
                     .or_insert((row.1, row.2, row.3));
@@ -634,22 +685,43 @@ pub fn evaluate_deterministic_problems(
         let staleness_threshold_ns: i64 = 300_000_000_000; // 5 minutes
         if let Ok(mut hb_stmt) = conn.prepare(
             r#"
-            SELECT node_id, MAX(end_time_unix_nano) AS last_seen_ns
+            SELECT node_id, service_name, MAX(end_time_unix_nano) AS last_seen_ns
             FROM v_traces
-            GROUP BY node_id
+            WHERE (?1 IS NULL OR end_time_unix_nano >= ?1)
+            GROUP BY node_id, service_name
             "#,
         ) {
             if let Ok(rows) =
-                hb_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                hb_stmt.query_map(params![exclusions.monitoring_since_unix_nano], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
             {
-                for (raw_node, last_seen_ns) in rows.flatten() {
+                let mut node_last_seen: BTreeMap<String, i64> = BTreeMap::new();
+                for (raw_node, raw_svc, last_seen_ns) in rows.flatten() {
+                    let clean_svc = redactor.redact_str(&raw_svc);
+                    if exclusions.is_service_excluded(&raw_svc)
+                        || exclusions.is_service_excluded(&clean_svc)
+                    {
+                        continue;
+                    }
+                    node_last_seen
+                        .entry(raw_node)
+                        .and_modify(|ts| *ts = (*ts).max(last_seen_ns))
+                        .or_insert(last_seen_ns);
+                }
+
+                for (raw_node, last_seen_ns) in node_last_seen {
                     let lag_ns = anchor_ts.saturating_sub(last_seen_ns);
                     if lag_ns > staleness_threshold_ns {
                         let clean_node = redactor.redact_host(&raw_node);
                         let last_trace: Option<String> = conn
                             .query_row(
-                                "SELECT trace_id FROM v_traces WHERE node_id = ?1 ORDER BY end_time_unix_nano DESC LIMIT 1",
-                                params![raw_node],
+                                "SELECT trace_id FROM v_traces WHERE node_id = ?1 AND (?2 IS NULL OR end_time_unix_nano >= ?2) ORDER BY end_time_unix_nano DESC LIMIT 1",
+                                params![raw_node, exclusions.monitoring_since_unix_nano],
                                 |r| r.get(0),
                             )
                             .ok();
@@ -681,26 +753,55 @@ pub fn evaluate_deterministic_problems(
     // 5. Evaluate hardware-stratified benchmark regressions and 30-day flaky tests (#34)
     let mut bench_repos = Vec::new();
     if let Ok(mut b_stmt) = conn.prepare(
-        "SELECT DISTINCT repo_key, commit_sha FROM v_benchmarks ORDER BY timestamp_unix_nano DESC LIMIT 10",
+        r#"
+        SELECT repo_key, commit_sha, MAX(timestamp_unix_nano) AS max_ts
+        FROM v_benchmarks
+        WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+        GROUP BY repo_key, commit_sha
+        ORDER BY max_ts DESC
+        "#,
     ) {
-        if let Ok(rows) = b_stmt.query_map([], |r| {
+        if let Ok(rows) = b_stmt.query_map(params![exclusions.monitoring_since_unix_nano], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         }) {
             for pair in rows.flatten() {
+                let clean_repo = redactor.redact_str(&pair.0);
+                if exclusions.is_repo_excluded(&pair.0) || exclusions.is_repo_excluded(&clean_repo)
+                {
+                    continue;
+                }
                 if !bench_repos.iter().any(|(rk, _)| rk == &pair.0) {
                     bench_repos.push(pair);
+                    if bench_repos.len() >= 10 {
+                        break;
+                    }
                 }
             }
         }
     }
     let mut test_repos = Vec::new();
-    if let Ok(mut t_stmt) = conn
-        .prepare("SELECT DISTINCT repo_key FROM v_tests ORDER BY timestamp_unix_nano DESC LIMIT 10")
-    {
-        if let Ok(rows) = t_stmt.query_map([], |r| r.get::<_, String>(0)) {
+    if let Ok(mut t_stmt) = conn.prepare(
+        r#"
+        SELECT repo_key, MAX(timestamp_unix_nano) AS max_ts
+        FROM v_tests
+        WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+        GROUP BY repo_key
+        ORDER BY max_ts DESC
+        "#,
+    ) {
+        if let Ok(rows) = t_stmt.query_map(params![exclusions.monitoring_since_unix_nano], |r| {
+            r.get::<_, String>(0)
+        }) {
             for rk in rows.flatten() {
+                let clean_repo = redactor.redact_str(&rk);
+                if exclusions.is_repo_excluded(&rk) || exclusions.is_repo_excluded(&clean_repo) {
+                    continue;
+                }
                 if !test_repos.contains(&rk) {
                     test_repos.push(rk);
+                    if test_repos.len() >= 10 {
+                        break;
+                    }
                 }
             }
         }
@@ -752,7 +853,14 @@ pub fn evaluate_deterministic_problems(
     }
 
     for repo_key in test_repos {
-        if let Ok(flaky_items) = compute_test_flakiness(store, &repo_key, None, 30, now_unix_nano) {
+        if let Ok(flaky_items) = compute_test_flakiness_with_min_ts(
+            store,
+            &repo_key,
+            None,
+            30,
+            now_unix_nano,
+            exclusions.monitoring_since_unix_nano,
+        ) {
             for item in flaky_items
                 .into_iter()
                 .filter(|t| t.flip_flop_count > 0 || !t.status.eq_ignore_ascii_case("ok"))

@@ -20,14 +20,18 @@ pub use ingress::{
 pub const DEFAULT_HOT_RETENTION_DAYS: u32 = 7;
 
 pub use analytics::{
-    compute_causal_problems, compute_purepath_waterfall, compute_smartscape_topology,
-    compute_test_flakiness, evaluate_benchmark_regressions, evaluate_canary_slo,
-    evaluate_deterministic_problems, evaluate_regression_gate, generate_statistical_diagnosis,
-    list_trace_summaries, synthesize_ai_diagnosis, CausalProblemCard, CausalProblemsFeedResponse,
-    FlakyTestItem, ProblemCard, ProblemSummary, ProblemsFeedResponse, PurePathLogEntry,
-    PurePathMetricEntry, PurePathResponse, PurePathSpanNode, SmartscapeEdge, SmartscapeHostNode,
-    SmartscapeProcessNode, SmartscapeServiceNode, SmartscapeTopology, TraceListFilter,
-    TraceListQuery, TraceListResponse, TraceSummaryDto, DEFAULT_SMARTSCAPE_WINDOW_SECS,
+    compute_causal_problems, compute_causal_problems_with_exclusions, compute_purepath_waterfall,
+    compute_smartscape_topology, compute_smartscape_topology_with_exclusions,
+    compute_test_flakiness, compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions,
+    evaluate_canary_slo, evaluate_deterministic_problems,
+    evaluate_deterministic_problems_with_exclusions, evaluate_regression_gate,
+    generate_statistical_diagnosis, list_trace_summaries, synthesize_ai_diagnosis,
+    CausalProblemCard, CausalProblemsFeedResponse, FlakyTestItem, MonitoringExclusions,
+    MonitoringExclusionsStatus, MonitoringExclusionsUpdateRequest, PersistedMonitoringExclusions,
+    ProblemCard, ProblemSummary, ProblemsFeedResponse, PurePathLogEntry, PurePathMetricEntry,
+    PurePathResponse, PurePathSpanNode, SmartscapeEdge, SmartscapeHostNode, SmartscapeProcessNode,
+    SmartscapeServiceNode, SmartscapeTopology, TraceListFilter, TraceListQuery, TraceListResponse,
+    TraceSummaryDto, DEFAULT_SMARTSCAPE_WINDOW_SECS,
 };
 pub use cli::{
     execute_cli_command, migrate_actionrunner_duckdb, parse_cli_args, ActionRunnerMigrationReport,

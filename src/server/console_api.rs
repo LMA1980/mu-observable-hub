@@ -17,11 +17,14 @@ use duckdb::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::analytics::causal::compute_causal_problems_with_exclusions;
+use crate::analytics::exclusions::{MonitoringExclusions, MonitoringExclusionsUpdateRequest};
 use crate::analytics::purepath::{
     compute_purepath_waterfall, list_trace_summaries, TraceListFilter, TraceListQuery,
 };
 use crate::analytics::smartscape::{
-    compute_smartscape_topology, evaluate_deterministic_problems, DEFAULT_SMARTSCAPE_WINDOW_SECS,
+    compute_smartscape_topology, evaluate_deterministic_problems_with_exclusions,
+    DEFAULT_SMARTSCAPE_WINDOW_SECS,
 };
 use crate::error::MuObserveError;
 use crate::ingress::{IngressEngine, UpstreamHealthChecker};
@@ -480,6 +483,17 @@ pub fn build_console_api_router_with_state(state: ConsoleApiState) -> Router {
         ],
         put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
     );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/status/exclusions",
+            "/api/v1/console/status/exclusions",
+            "/api/observe/status/exclusions",
+            "/api/status/exclusions",
+            "/api/obs/v1/status/exclusions",
+        ],
+        get(handle_get_monitoring_exclusions).put(handle_put_monitoring_exclusions),
+    );
 
     router.fallback(handle_ingress_fallback).with_state(state)
 }
@@ -525,10 +539,12 @@ async fn collect_causal_problem_cards(
     subsystems: &SubsystemStatusRegistry,
     window_secs: u64,
 ) -> Result<CausalMaintenanceFilterOutcome, MuObserveError> {
+    let exclusions = MonitoringExclusions::resolve(store);
     let causal_problems =
-        crate::analytics::causal::compute_causal_problems(store, window_secs, None)?;
+        compute_causal_problems_with_exclusions(store, window_secs, None, &exclusions)?;
 
-    let deterministic_feed = evaluate_deterministic_problems(store, window_secs, None).ok();
+    let deterministic_feed =
+        evaluate_deterministic_problems_with_exclusions(store, window_secs, None, &exclusions).ok();
     let mut all_problems = causal_problems;
     if let Some(feed) = deterministic_feed {
         for dp in feed.problems {
@@ -855,6 +871,52 @@ async fn handle_delete_subsystem_maintenance(
         },
     )
     .await
+}
+
+async fn handle_get_monitoring_exclusions(
+    State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = authorize_http_any_read(
+        &*auth,
+        &headers,
+        &[
+            ObsPermission::PlatformMaintenanceRead,
+            ObsPermission::ProblemsRead,
+        ],
+    ) {
+        return *resp;
+    }
+    let status = MonitoringExclusions::resolve_status(&store);
+    no_store_json(StatusCode::OK, &status)
+}
+
+async fn handle_put_monitoring_exclusions(
+    State(store): State<HotDuckDbStore>,
+    State(auth): State<Arc<dyn ObsAuthVerifier>>,
+    headers: HeaderMap,
+    payload_res: Result<
+        Json<MonitoringExclusionsUpdateRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let auth_ctx =
+        match authorize_http_request(&*auth, &headers, ObsPermission::PlatformMaintenanceWrite) {
+            Ok(ctx) => ctx,
+            Err(resp) => return *resp,
+        };
+
+    let Json(payload) = match payload_res {
+        Ok(p) => p,
+        Err(err) => return json_error_response(StatusCode::BAD_REQUEST, &err.to_string()),
+    };
+
+    match MonitoringExclusions::apply_update(&store, &payload, auth_ctx.subject.as_deref()) {
+        Ok(status) => no_store_json(StatusCode::OK, &status),
+        Err(MuObserveError::Validation(msg)) => json_error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(err) => json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+    }
 }
 
 async fn handle_get_ingress_routes(
