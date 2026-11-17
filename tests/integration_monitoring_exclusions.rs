@@ -704,3 +704,240 @@ async fn test_put_status_exclusions_auth_persistence_and_dynamic_registry_sync()
         .unwrap();
     assert!(unfiltered.is_empty());
 }
+
+#[tokio::test]
+async fn test_batch_ci_execution_spans_excluded_from_latency_slo_and_causal_alerts() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env_guard = EnvRestoreGuard::capture(&[
+        "MUOBSERVE_EXCLUDED_REPOS",
+        "MUOBSERVE_RETIRED_SERVICES",
+        "MUOBSERVE_MONITORING_SINCE_UNIX_NANO",
+    ]);
+    std::env::remove_var("MUOBSERVE_EXCLUDED_REPOS");
+    std::env::remove_var("MUOBSERVE_RETIRED_SERVICES");
+    std::env::remove_var("MUOBSERVE_MONITORING_SINCE_UNIX_NANO");
+
+    // Scenario A: Healthy multi-second batch CI execution spans on mu-ci-controller trigger
+    // zero latency SLO or causal alerts while remaining visible in topology counts and v_traces.
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let now_ts = 1_794_892_800_000_000_000i64;
+    store
+        .insert_spans_batch(&[
+            OtelSpanEntry {
+                trace_id: "trace-ci-ok-1".into(),
+                span_id: "span-pipeline-1".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "node-b".into(),
+                span_name: "ci.pipeline.run:LMA1980/mu-console".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 132_000_000_000,
+                end_time_unix_nano: now_ts,
+                duration_ns: 132_000_000_000, // 132s
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: r#"{"domain":"ci"}"#.into(),
+            },
+            OtelSpanEntry {
+                trace_id: "trace-ci-ok-1".into(),
+                span_id: "span-stage-fmt".into(),
+                parent_span_id: Some("span-pipeline-1".into()),
+                service_name: "mu-ci-controller".into(),
+                node_id: "node-b".into(),
+                span_name: "ci.stage.dispatch:fmt-check".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: now_ts - 130_000_000_000,
+                end_time_unix_nano: now_ts - 106_000_000_000,
+                duration_ns: 24_000_000_000, // 24s
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: r#"{"domain":"ci"}"#.into(),
+            },
+        ])
+        .unwrap();
+
+    let causal_ok = compute_causal_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert!(
+        causal_ok.is_empty(),
+        "OK batch CI spans must not produce causal problems: {causal_ok:?}"
+    );
+
+    let det_ok = evaluate_deterministic_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert_eq!(det_ok.open_count, 0, "unexpected problems: {det_ok:?}");
+
+    let topo_ok = compute_smartscape_topology(&store, 3600, Some(now_ts)).unwrap();
+    let ctrl_node = topo_ok
+        .services
+        .iter()
+        .find(|s| s.name == "mu-ci-controller")
+        .expect("mu-ci-controller present in Smartscape");
+    assert_eq!(ctrl_node.span_count, 2);
+    assert_eq!(ctrl_node.error_count, 0);
+    assert_eq!(ctrl_node.p95_latency_ms, 0.0);
+    assert_eq!(ctrl_node.health_state, "healthy");
+
+    // 100% raw DuckDB view retention verified per Maintainer Decision A1
+    assert_eq!(store.count_rows("v_traces").unwrap(), 2);
+    let sql_res = execute_guarded_sql(
+        &store,
+        "SELECT span_name FROM v_traces ORDER BY span_name",
+        10,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(sql_res.rows.len(), 2);
+    assert_eq!(
+        sql_res.rows[0][0],
+        Value::String("ci.pipeline.run:LMA1980/mu-console".into())
+    );
+    assert_eq!(
+        sql_res.rows[1][0],
+        Value::String("ci.stage.dispatch:fmt-check".into())
+    );
+
+    // Scenario B: Interactive 10ms RPC alongside an ERROR batch CI span keeps latency healthy
+    // while surfacing PROB-ERRORS-* and causal error attribution pointing to the ERROR trace.
+    store
+        .insert_spans_batch(&[
+            OtelSpanEntry {
+                trace_id: "trace-rpc-healthy".into(),
+                span_id: "span-rpc-healthy".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "node-b".into(),
+                span_name: "GET /api/repos".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 10_000_000,
+                end_time_unix_nano: now_ts,
+                duration_ns: 10_000_000, // 10ms
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            },
+            OtelSpanEntry {
+                trace_id: "trace-ci-err-1".into(),
+                span_id: "span-stage-err".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "node-b".into(),
+                span_name: "ci.stage.dispatch:test-check".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: now_ts - 24_000_000_000,
+                end_time_unix_nano: now_ts,
+                duration_ns: 24_000_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("stage failed".into()),
+                attributes_json: r#"{"domain":"ci"}"#.into(),
+            },
+        ])
+        .unwrap();
+
+    let causal_err = compute_causal_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert_eq!(causal_err.len(), 1);
+    assert_eq!(causal_err[0].category, "error_rate_spike");
+    assert_eq!(
+        causal_err[0].root_cause_trace_id.as_deref(),
+        Some("trace-ci-err-1")
+    );
+
+    let det_err = evaluate_deterministic_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert!(!det_err
+        .problems
+        .iter()
+        .any(|p| p.problem_id == "PROB-LATENCY-mu-ci-controller"));
+    let err_card = det_err
+        .problems
+        .iter()
+        .find(|p| p.problem_id == "PROB-ERRORS-mu-ci-controller")
+        .expect("PROB-ERRORS-mu-ci-controller raised on ERROR CI span");
+    assert_eq!(
+        err_card.root_cause_trace_id.as_deref(),
+        Some("trace-ci-err-1")
+    );
+
+    // Scenario C: Slow interactive RPC trace is attributed (not the 132s OK batch CI trace).
+    let store2 = HotDuckDbStore::open_in_memory().expect("open store2");
+    let mut mixed_spans = Vec::new();
+    mixed_spans.push(OtelSpanEntry {
+        trace_id: "trace-batch-slow".into(),
+        span_id: "span-batch-slow".into(),
+        parent_span_id: None,
+        service_name: "mu-ci-controller".into(),
+        node_id: "node-b".into(),
+        span_name: "ci.pipeline.run:LMA1980/mu-console".into(),
+        span_kind: "SERVER".into(),
+        start_time_unix_nano: now_ts - 132_000_000_000,
+        end_time_unix_nano: now_ts,
+        duration_ns: 132_000_000_000,
+        status_code: "OK".into(),
+        status_message: None,
+        attributes_json: r#"{"domain":"ci"}"#.into(),
+    });
+    for i in 0..18 {
+        mixed_spans.push(OtelSpanEntry {
+            trace_id: format!("trace-rpc-fast-{i}"),
+            span_id: format!("span-rpc-fast-{i}"),
+            parent_span_id: None,
+            service_name: "mu-ci-controller".into(),
+            node_id: "node-b".into(),
+            span_name: "GET /api/jobs".into(),
+            span_kind: "SERVER".into(),
+            start_time_unix_nano: now_ts - 20_000_000 + i * 1_000_000,
+            end_time_unix_nano: now_ts - 15_000_000 + i * 1_000_000,
+            duration_ns: 5_000_000,
+            status_code: "OK".into(),
+            status_message: None,
+            attributes_json: "{}".into(),
+        });
+    }
+    mixed_spans.push(OtelSpanEntry {
+        trace_id: "trace-rpc-slow-1".into(),
+        span_id: "span-rpc-slow-1".into(),
+        parent_span_id: None,
+        service_name: "mu-ci-controller".into(),
+        node_id: "node-b".into(),
+        span_name: "GET /api/jobs".into(),
+        span_kind: "SERVER".into(),
+        start_time_unix_nano: now_ts - 500_000_000,
+        end_time_unix_nano: now_ts,
+        duration_ns: 500_000_000, // 500ms > 250ms and MAD spike over 5ms baseline
+        status_code: "OK".into(),
+        status_message: None,
+        attributes_json: "{}".into(),
+    });
+    mixed_spans.push(OtelSpanEntry {
+        trace_id: "trace-rpc-slow".into(),
+        span_id: "span-rpc-slow".into(),
+        parent_span_id: None,
+        service_name: "mu-ci-controller".into(),
+        node_id: "node-b".into(),
+        span_name: "GET /api/jobs".into(),
+        span_kind: "SERVER".into(),
+        start_time_unix_nano: now_ts - 600_000_000,
+        end_time_unix_nano: now_ts,
+        duration_ns: 600_000_000, // 600ms slowest interactive RPC trace
+        status_code: "OK".into(),
+        status_message: None,
+        attributes_json: "{}".into(),
+    });
+    store2.insert_spans_batch(&mixed_spans).unwrap();
+
+    let det_slow = evaluate_deterministic_problems(&store2, 3600, Some(now_ts)).unwrap();
+    let lat_card = det_slow
+        .problems
+        .iter()
+        .find(|p| p.problem_id == "PROB-LATENCY-mu-ci-controller")
+        .expect("PROB-LATENCY raised by slow interactive RPC");
+    assert_eq!(
+        lat_card.root_cause_trace_id.as_deref(),
+        Some("trace-rpc-slow")
+    );
+
+    let causal_slow = compute_causal_problems(&store2, 3600, Some(now_ts)).unwrap();
+    assert_eq!(causal_slow.len(), 1);
+    assert_eq!(causal_slow[0].category, "latency_regression");
+    assert_eq!(
+        causal_slow[0].root_cause_trace_id.as_deref(),
+        Some("trace-rpc-slow")
+    );
+}

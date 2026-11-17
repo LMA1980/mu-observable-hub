@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use duckdb::params;
 use serde::{Deserialize, Serialize};
 
-use crate::analytics::exclusions::MonitoringExclusions;
+use crate::analytics::exclusions::{is_batch_ci_execution_span, MonitoringExclusions};
 use crate::analytics::regression::{
     compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, DEFAULT_MAX_MAD_Z_SCORE,
 };
@@ -185,12 +185,47 @@ pub fn compute_smartscape_topology_with_exclusions(
         node_id: String,
         duration_ms: f64,
         is_error: bool,
+        is_batch_ci: bool,
+    }
+
+    #[derive(Default)]
+    struct MetricBucket {
+        interactive_durations_ms: Vec<f64>,
+        span_count: u64,
+        error_count: u64,
+    }
+
+    impl MetricBucket {
+        fn push(&mut self, sp: &SpanRow) {
+            self.span_count += 1;
+            if sp.is_error {
+                self.error_count += 1;
+            }
+            if !sp.is_batch_ci {
+                self.interactive_durations_ms.push(sp.duration_ms);
+            }
+        }
+
+        fn summarize(mut self, win_f64: f64) -> (u64, u64, f64, f64, f64, f64, f64) {
+            let count = self.span_count;
+            let err_cnt = self.error_count;
+            let rps = (count as f64) / win_f64;
+            let err_pct = if count > 0 {
+                (err_cnt as f64 * 100.0) / (count as f64)
+            } else {
+                0.0
+            };
+            let p50 = percentile(&mut self.interactive_durations_ms, 0.50);
+            let p95 = percentile(&mut self.interactive_durations_ms, 0.95);
+            let p99 = percentile(&mut self.interactive_durations_ms, 0.99);
+            (count, err_cnt, rps, err_pct, p50, p95, p99)
+        }
     }
 
     let mut stmt = conn.prepare(
         r#"
         SELECT
-            trace_id, span_id, parent_span_id, service_name, node_id, duration_ns, status_code
+            trace_id, span_id, parent_span_id, service_name, node_id, duration_ns, status_code, span_name
         FROM v_traces
         WHERE end_time_unix_nano >= ?1
         ORDER BY start_time_unix_nano ASC
@@ -202,6 +237,7 @@ pub fn compute_smartscape_topology_with_exclusions(
         let status: String = r.get(6)?;
         let raw_svc: String = r.get(3)?;
         let raw_node: String = r.get(4)?;
+        let span_name: String = r.get(7)?;
         let clean_svc = redactor.redact_str(&raw_svc);
         Ok((
             raw_svc,
@@ -213,6 +249,7 @@ pub fn compute_smartscape_topology_with_exclusions(
                 node_id: redactor.redact_host(&raw_node),
                 duration_ms: (dur_ns.max(0) as f64) / 1_000_000.0,
                 is_error: status.eq_ignore_ascii_case("ERROR"),
+                is_batch_ci: is_batch_ci_execution_span(&span_name),
             },
         ))
     })?;
@@ -258,9 +295,9 @@ pub fn compute_smartscape_topology_with_exclusions(
     }
 
     // Aggregate per service, per process (service@host), and per host
-    let mut svc_buckets: BTreeMap<String, (Vec<f64>, u64)> = BTreeMap::new();
-    let mut proc_buckets: BTreeMap<(String, String), (Vec<f64>, u64)> = BTreeMap::new();
-    let mut host_buckets: BTreeMap<String, (Vec<f64>, u64)> = BTreeMap::new();
+    let mut svc_buckets: BTreeMap<String, MetricBucket> = BTreeMap::new();
+    let mut proc_buckets: BTreeMap<(String, String), MetricBucket> = BTreeMap::new();
+    let mut host_buckets: BTreeMap<String, MetricBucket> = BTreeMap::new();
     let mut span_lookup: BTreeMap<(String, String), String> = BTreeMap::new();
 
     for sp in &all_spans {
@@ -269,45 +306,24 @@ pub fn compute_smartscape_topology_with_exclusions(
             sp.service_name.clone(),
         );
 
-        let svc_entry = svc_buckets
+        svc_buckets
             .entry(sp.service_name.clone())
-            .or_insert_with(|| (Vec::new(), 0));
-        svc_entry.0.push(sp.duration_ms);
-        if sp.is_error {
-            svc_entry.1 += 1;
-        }
+            .or_default()
+            .push(sp);
 
-        let proc_entry = proc_buckets
+        proc_buckets
             .entry((sp.service_name.clone(), sp.node_id.clone()))
-            .or_insert_with(|| (Vec::new(), 0));
-        proc_entry.0.push(sp.duration_ms);
-        if sp.is_error {
-            proc_entry.1 += 1;
-        }
+            .or_default()
+            .push(sp);
 
-        let host_entry = host_buckets
-            .entry(sp.node_id.clone())
-            .or_insert_with(|| (Vec::new(), 0));
-        host_entry.0.push(sp.duration_ms);
-        if sp.is_error {
-            host_entry.1 += 1;
-        }
+        host_buckets.entry(sp.node_id.clone()).or_default().push(sp);
     }
 
     let win_f64 = bounded_window as f64;
 
     let mut services = Vec::new();
-    for (svc_name, (mut durs, err_cnt)) in svc_buckets {
-        let count = durs.len() as u64;
-        let rps = (count as f64) / win_f64;
-        let err_pct = if count > 0 {
-            (err_cnt as f64 * 100.0) / (count as f64)
-        } else {
-            0.0
-        };
-        let p50 = percentile(&mut durs, 0.50);
-        let p95 = percentile(&mut durs, 0.95);
-        let p99 = percentile(&mut durs, 0.99);
+    for (svc_name, bucket) in svc_buckets {
+        let (count, err_cnt, rps, err_pct, p50, p95, p99) = bucket.summarize(win_f64);
         services.push(SmartscapeServiceNode {
             id: format!("svc:{svc_name}"),
             name: svc_name,
@@ -325,17 +341,8 @@ pub fn compute_smartscape_topology_with_exclusions(
 
     let mut processes = Vec::new();
     let mut vertical_edges = Vec::new();
-    for ((svc_name, host_name), (mut durs, err_cnt)) in proc_buckets {
-        let count = durs.len() as u64;
-        let rps = (count as f64) / win_f64;
-        let err_pct = if count > 0 {
-            (err_cnt as f64 * 100.0) / (count as f64)
-        } else {
-            0.0
-        };
-        let p50 = percentile(&mut durs, 0.50);
-        let p95 = percentile(&mut durs, 0.95);
-        let p99 = percentile(&mut durs, 0.99);
+    for ((svc_name, host_name), bucket) in proc_buckets {
+        let (count, err_cnt, rps, err_pct, p50, p95, p99) = bucket.summarize(win_f64);
         let proc_id = format!("proc:{svc_name}@{host_name}");
         let svc_id = format!("svc:{svc_name}");
         let host_id = format!("host:{host_name}");
@@ -384,15 +391,8 @@ pub fn compute_smartscape_topology_with_exclusions(
     }
 
     let mut hosts = Vec::new();
-    for (host_name, (mut durs, err_cnt)) in host_buckets {
-        let count = durs.len() as u64;
-        let rps = (count as f64) / win_f64;
-        let err_pct = if count > 0 {
-            (err_cnt as f64 * 100.0) / (count as f64)
-        } else {
-            0.0
-        };
-        let p95 = percentile(&mut durs, 0.95);
+    for (host_name, bucket) in host_buckets {
+        let (count, err_cnt, rps, err_pct, _p50, p95, _p99) = bucket.summarize(win_f64);
         let default_arch = if host_name.contains("riscv64") {
             "riscv64gc".to_string()
         } else {
@@ -421,36 +421,24 @@ pub fn compute_smartscape_topology_with_exclusions(
     }
 
     // Aggregate parent -> child service call edges
-    let mut call_buckets: BTreeMap<(String, String), (Vec<f64>, u64)> = BTreeMap::new();
+    let mut call_buckets: BTreeMap<(String, String), MetricBucket> = BTreeMap::new();
     for sp in &all_spans {
         if let Some(parent_id) = &sp.parent_span_id {
             if !parent_id.is_empty() {
                 if let Some(caller_svc) = span_lookup.get(&(sp.trace_id.clone(), parent_id.clone()))
                 {
-                    let entry = call_buckets
+                    call_buckets
                         .entry((caller_svc.clone(), sp.service_name.clone()))
-                        .or_insert_with(|| (Vec::new(), 0));
-                    entry.0.push(sp.duration_ms);
-                    if sp.is_error {
-                        entry.1 += 1;
-                    }
+                        .or_default()
+                        .push(sp);
                 }
             }
         }
     }
 
     let mut edges = Vec::new();
-    for ((caller, callee), (mut durs, err_cnt)) in call_buckets {
-        let count = durs.len() as u64;
-        let rps = (count as f64) / win_f64;
-        let err_pct = if count > 0 {
-            (err_cnt as f64 * 100.0) / (count as f64)
-        } else {
-            0.0
-        };
-        let p50 = percentile(&mut durs, 0.50);
-        let p95 = percentile(&mut durs, 0.95);
-        let p99 = percentile(&mut durs, 0.99);
+    for ((caller, callee), bucket) in call_buckets {
+        let (count, _err_cnt, rps, err_pct, p50, p95, p99) = bucket.summarize(win_f64);
         edges.push(SmartscapeEdge {
             source: format!("svc:{caller}"),
             target: format!("svc:{callee}"),
@@ -923,6 +911,10 @@ fn find_slowest_trace_for_service(
         FROM v_traces
         WHERE service_name = ?1
           AND end_time_unix_nano >= ?2
+          AND NOT (
+              STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.pipeline.')
+              OR STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.stage.')
+          )
         ORDER BY duration_ns DESC
         LIMIT 1
         "#,
