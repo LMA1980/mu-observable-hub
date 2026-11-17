@@ -6,6 +6,7 @@ use mu_observable_ipc::{
     TestRegressionItem,
 };
 
+use crate::analytics::exclusions::MonitoringExclusions;
 use crate::error::MuObserveError;
 use crate::storage::hot_duckdb::HotDuckDbStore;
 
@@ -196,6 +197,30 @@ pub fn compute_test_flakiness_with_min_ts(
     now_unix_nano: Option<i64>,
     min_timestamp_unix_nano: Option<i64>,
 ) -> Result<Vec<TestRegressionItem>, MuObserveError> {
+    let computed = compute_test_flakiness_internal(
+        store,
+        repo_key,
+        candidate_commit,
+        window_days,
+        now_unix_nano,
+        min_timestamp_unix_nano,
+    )?;
+    Ok(computed.into_iter().map(|c| c.item).collect())
+}
+
+struct ComputedTestFlakiness {
+    item: TestRegressionItem,
+    ran_on_candidate: bool,
+}
+
+fn compute_test_flakiness_internal(
+    store: &HotDuckDbStore,
+    repo_key: &str,
+    candidate_commit: Option<&str>,
+    window_days: u32,
+    now_unix_nano: Option<i64>,
+    min_timestamp_unix_nano: Option<i64>,
+) -> Result<Vec<ComputedTestFlakiness>, MuObserveError> {
     let conn = store.lock_conn()?;
 
     let max_ts: i64 = match now_unix_nano {
@@ -249,62 +274,86 @@ pub fn compute_test_flakiness_with_min_ts(
         })
     })?;
 
-    let mut grouped: BTreeMap<(String, String), Vec<TestRunObs>> = BTreeMap::new();
+    // Partition by `(crate_name, test_binary, test_name)` so distinct runners such as
+    // `cargo-test` and `cargo-miri` never cross-contaminate flakiness or mask runner failures.
+    let mut grouped: BTreeMap<(String, String, String), Vec<TestRunObs>> = BTreeMap::new();
     for r in rows {
         let obs = r?;
         grouped
-            .entry((obs.crate_name.clone(), obs.test_name.clone()))
+            .entry((
+                obs.crate_name.clone(),
+                obs.test_binary.clone(),
+                obs.test_name.clone(),
+            ))
             .or_default()
             .push(obs);
     }
 
     let mut results = Vec::new();
-    for ((crate_name, test_name), history) in grouped {
+    for ((crate_name, test_binary, test_name), history) in grouped {
         if history.is_empty() {
             continue;
         }
         let mut flip_flops = 0u32;
+        let mut executed_count = 0usize;
         let mut prev_passed: Option<bool> = None;
-        let mut latest_for_candidate: Option<&TestRunObs> = None;
+        let mut latest_executed_for_candidate: Option<&TestRunObs> = None;
+        let mut latest_any_for_candidate: Option<&TestRunObs> = None;
+        let mut latest_executed: Option<&TestRunObs> = None;
         let mut latest_failure_summary: Option<String> = None;
 
         for item in &history {
-            let passed = is_pass_status(&item.status);
-            if !passed && item.failure_summary.is_some() {
-                latest_failure_summary.clone_from(&item.failure_summary);
-            }
-            if let Some(prev) = prev_passed {
-                if prev != passed {
-                    flip_flops = flip_flops.saturating_add(1);
+            let ignored = is_ignored_status(&item.status);
+            if !ignored {
+                executed_count = executed_count.saturating_add(1);
+                let passed = is_pass_status(&item.status);
+                if !passed && item.failure_summary.is_some() {
+                    latest_failure_summary.clone_from(&item.failure_summary);
                 }
+                if let Some(prev) = prev_passed {
+                    if prev != passed {
+                        flip_flops = flip_flops.saturating_add(1);
+                    }
+                }
+                prev_passed = Some(passed);
+                latest_executed = Some(item);
             }
-            prev_passed = Some(passed);
             if let Some(cand) = candidate_commit {
                 if item.commit_sha == cand {
-                    latest_for_candidate = Some(item);
+                    latest_any_for_candidate = Some(item);
+                    if !ignored {
+                        latest_executed_for_candidate = Some(item);
+                    }
                 }
             }
         }
 
-        let transitions = history.len().saturating_sub(1);
+        let transitions = executed_count.saturating_sub(1);
         let flakiness_pct = if transitions > 0 {
             (f64::from(flip_flops) / (transitions as f64)) * 100.0
         } else {
             0.0
         };
 
-        let representative = latest_for_candidate.unwrap_or_else(|| history.last().unwrap());
-        results.push(TestRegressionItem {
-            crate_name,
-            test_binary: representative.test_binary.clone(),
-            test_name,
-            status: representative.status.clone(),
-            flakiness_pct,
-            flip_flop_count: flip_flops,
-            failure_summary: representative
-                .failure_summary
-                .clone()
-                .or(latest_failure_summary),
+        let ran_on_candidate = latest_any_for_candidate.is_some();
+        let representative = latest_executed_for_candidate
+            .or(latest_any_for_candidate)
+            .or(latest_executed)
+            .unwrap_or_else(|| history.last().unwrap());
+        results.push(ComputedTestFlakiness {
+            item: TestRegressionItem {
+                crate_name,
+                test_binary,
+                test_name,
+                status: representative.status.clone(),
+                flakiness_pct,
+                flip_flop_count: flip_flops,
+                failure_summary: representative
+                    .failure_summary
+                    .clone()
+                    .or(latest_failure_summary),
+            },
+            ran_on_candidate,
         });
     }
 
@@ -340,16 +389,26 @@ pub fn evaluate_regression_gate(
     let regressed_benchmarks: Vec<BenchmarkRegressionItem> =
         all_benches.into_iter().filter(|b| b.regressed).collect();
 
-    let all_tests =
-        compute_test_flakiness(store, &req.repo_key, Some(&req.candidate_commit), 30, None)?;
+    let monitoring_since = MonitoringExclusions::resolve(store).monitoring_since_unix_nano;
+
+    let all_tests = compute_test_flakiness_internal(
+        store,
+        &req.repo_key,
+        Some(&req.candidate_commit),
+        30,
+        None,
+        monitoring_since,
+    )?;
 
     let mut hard_test_failure = false;
     let mut flaky_warning = false;
     let mut flaky_or_failed_tests = Vec::new();
 
-    for t in all_tests {
-        let failed = !is_pass_status(&t.status);
-        let flaky = t.flakiness_pct > max_flakiness || t.flip_flop_count > 0;
+    for computed in all_tests {
+        let t = computed.item;
+        let ignored = is_ignored_status(&t.status);
+        let failed = computed.ran_on_candidate && !ignored && !is_pass_status(&t.status);
+        let flaky = !ignored && (t.flakiness_pct > max_flakiness || t.flip_flop_count > 0);
         if failed {
             hard_test_failure = true;
             flaky_or_failed_tests.push(t);
@@ -387,10 +446,17 @@ pub fn evaluate_regression_gate(
     })
 }
 
-fn is_pass_status(status: &str) -> bool {
+pub(crate) fn is_pass_status(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_lowercase().as_str(),
         "ok" | "pass" | "passed" | "success"
+    )
+}
+
+pub(crate) fn is_ignored_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "ignored" | "ignore" | "skip" | "skipped"
     )
 }
 
@@ -604,5 +670,153 @@ mod tests {
         .expect("gate report");
         assert_eq!(report.verdict, RegressionVerdict::Warn);
         assert_eq!(report.flaky_or_failed_tests.len(), 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_miri_ignored_tests_do_not_trigger_flakiness_or_gate_failure() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let base_ts = 1_700_000_000_000_000_000i64;
+
+        // Same test passes in cargo-test/cargo-llvm-cov and is #[cfg_attr(miri, ignore)] in cargo-miri.
+        // Also verify an older failure on another commit does not fail a healthy candidate commit
+        // that did not run that removed/branch-only test.
+        let entries = vec![
+            TestCaseRunEntry {
+                job_id: "job-old-branch".into(),
+                repo_key: "lma1980/mu-console".into(),
+                branch_key: "feat/abandoned".into(),
+                commit_sha: "sha-abandoned".into(),
+                crate_name: "mu-console-data".into(),
+                test_binary: "cargo-test".into(),
+                test_name: "tests::removed_experiment_test".into(),
+                status: "failed".into(),
+                duration_ms: 2.0,
+                failure_summary: Some("assertion failed on abandoned branch".into()),
+                timestamp_unix_nano: base_ts + 1_000_000_000,
+                node_id: "worker-x86_64".into(),
+                arch: "x86_64".into(),
+            },
+            TestCaseRunEntry {
+                job_id: "job-cand".into(),
+                repo_key: "lma1980/mu-console".into(),
+                branch_key: "main".into(),
+                commit_sha: "sha-main-cand".into(),
+                crate_name: "mu-console-data".into(),
+                test_binary: "cargo-test".into(),
+                test_name: "tests::cold_boot_fails_closed_until_session_resolves".into(),
+                status: "ok".into(),
+                duration_ms: 3.0,
+                failure_summary: None,
+                timestamp_unix_nano: base_ts + 2_000_000_000,
+                node_id: "worker-x86_64".into(),
+                arch: "x86_64".into(),
+            },
+            TestCaseRunEntry {
+                job_id: "job-cand".into(),
+                repo_key: "lma1980/mu-console".into(),
+                branch_key: "main".into(),
+                commit_sha: "sha-main-cand".into(),
+                crate_name: "mu-console-data".into(),
+                test_binary: "cargo-miri".into(),
+                test_name: "tests::cold_boot_fails_closed_until_session_resolves".into(),
+                status: "ignored".into(),
+                duration_ms: 0.0,
+                failure_summary: None,
+                timestamp_unix_nano: base_ts + 3_000_000_000,
+                node_id: "worker-x86_64".into(),
+                arch: "x86_64".into(),
+            },
+        ];
+        store
+            .insert_test_runs_batch(&entries)
+            .expect("insert test runs");
+
+        let report = evaluate_regression_gate(
+            &store,
+            &RegressionGateRequest {
+                request_id: "gate-miri-ignored".into(),
+                repo_key: "lma1980/mu-console".into(),
+                candidate_commit: "sha-main-cand".into(),
+                baseline_branch: "main".into(),
+                max_slowdown_pct: 10.0,
+                max_flakiness_pct: 5.0,
+            },
+        )
+        .expect("gate report");
+        assert_eq!(report.verdict, RegressionVerdict::Pass);
+        assert!(report.flaky_or_failed_tests.is_empty());
+
+        let problems = crate::analytics::evaluate_deterministic_problems(&store, 3600, None)
+            .expect("deterministic problems");
+        assert!(
+            !problems
+                .problems
+                .iter()
+                .any(|p| p.category == "test_flakiness"
+                    && p.problem_id
+                        .contains("cold_boot_fails_closed_until_session_resolves")),
+            "ignored cargo-miri test must not emit test_flakiness problem cards"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_real_cargo_miri_failure_still_fails_gate_even_when_cargo_test_passes() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let base_ts = 1_700_000_000_000_000_000i64;
+
+        let entries = vec![
+            TestCaseRunEntry {
+                job_id: "job-ub".into(),
+                repo_key: "lma1980/k3-core".into(),
+                branch_key: "feat/ub-check".into(),
+                commit_sha: "sha-ub".into(),
+                crate_name: "k3-core".into(),
+                test_binary: "cargo-miri".into(),
+                test_name: "arena::tests::test_aligned_write".into(),
+                status: "failed".into(),
+                duration_ms: 12.0,
+                failure_summary: Some("Undefined Behavior: out-of-bounds pointer".into()),
+                timestamp_unix_nano: base_ts + 1_000_000_000,
+                node_id: "worker-x86_64".into(),
+                arch: "x86_64".into(),
+            },
+            TestCaseRunEntry {
+                job_id: "job-ub".into(),
+                repo_key: "lma1980/k3-core".into(),
+                branch_key: "feat/ub-check".into(),
+                commit_sha: "sha-ub".into(),
+                crate_name: "k3-core".into(),
+                test_binary: "cargo-test".into(),
+                test_name: "arena::tests::test_aligned_write".into(),
+                status: "ok".into(),
+                duration_ms: 1.0,
+                failure_summary: None,
+                timestamp_unix_nano: base_ts + 2_000_000_000,
+                node_id: "worker-x86_64".into(),
+                arch: "x86_64".into(),
+            },
+        ];
+        store
+            .insert_test_runs_batch(&entries)
+            .expect("insert test runs");
+
+        let report = evaluate_regression_gate(
+            &store,
+            &RegressionGateRequest {
+                request_id: "gate-miri-ub".into(),
+                repo_key: "lma1980/k3-core".into(),
+                candidate_commit: "sha-ub".into(),
+                baseline_branch: "main".into(),
+                max_slowdown_pct: 10.0,
+                max_flakiness_pct: 5.0,
+            },
+        )
+        .expect("gate report");
+        assert_eq!(report.verdict, RegressionVerdict::Fail);
+        assert_eq!(report.flaky_or_failed_tests.len(), 1);
+        assert_eq!(report.flaky_or_failed_tests[0].test_binary, "cargo-miri");
+        assert_eq!(report.flaky_or_failed_tests[0].status, "failed");
     }
 }

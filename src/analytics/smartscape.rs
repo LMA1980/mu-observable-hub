@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::analytics::exclusions::{is_batch_ci_execution_span, MonitoringExclusions};
 use crate::analytics::regression::{
-    compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, DEFAULT_MAX_MAD_Z_SCORE,
+    compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, is_ignored_status,
+    is_pass_status, DEFAULT_MAX_MAD_Z_SCORE,
 };
 use crate::error::MuObserveError;
 use crate::server::sanitize::PrivacyRedactor;
@@ -887,18 +888,21 @@ pub fn evaluate_deterministic_problems_with_exclusions(
             now_unix_nano,
             exclusions.monitoring_since_unix_nano,
         ) {
-            for item in flaky_items
-                .into_iter()
-                .filter(|t| t.flip_flop_count > 0 || !t.status.eq_ignore_ascii_case("ok"))
-            {
+            for item in flaky_items.into_iter().filter(|t| {
+                t.flip_flop_count > 0
+                    || (!is_pass_status(&t.status) && !is_ignored_status(&t.status))
+            }) {
                 let clean_repo = redactor.redact_str(&repo_key);
                 problems.push(ProblemCard {
-                    problem_id: format!("PROB-TEST-{}-{}", item.crate_name, item.test_name),
-                    title: format!(
-                        "Flaky / Failing Test {}::{}",
-                        item.crate_name, item.test_name
+                    problem_id: format!(
+                        "PROB-TEST-{}-{}-{}",
+                        item.crate_name, item.test_binary, item.test_name
                     ),
-                    severity: if item.status.eq_ignore_ascii_case("ok") {
+                    title: format!(
+                        "Flaky / Failing Test {}::{} ({})",
+                        item.crate_name, item.test_name, item.test_binary
+                    ),
+                    severity: if is_pass_status(&item.status) {
                         "warning".into()
                     } else {
                         "error".into()
