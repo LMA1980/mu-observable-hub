@@ -53,7 +53,11 @@ async fn main() {
             .unwrap_or_else(|_| "127.0.0.1:9480".to_string());
         let mcp_store = store.clone();
         let node_id = std::env::var("MUOBSERVE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
-        let ingress_engine = mu_observable_hub::IngressEngine::new(store.clone(), node_id);
+        let ingress_engine = mu_observable_hub::IngressEngine::new_with_listen_addr(
+            store.clone(),
+            node_id,
+            &mcp_http_addr,
+        );
         mu_observable_hub::UpstreamHealthChecker::spawn(
             ingress_engine.clone(),
             std::time::Duration::from_secs(10),

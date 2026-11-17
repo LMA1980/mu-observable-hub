@@ -252,192 +252,236 @@ pub fn build_console_api_router_with_auth(
     })
 }
 
+/// Mounts a route on both `path` and its trailing-slash variant (`{path}/`) so native handlers
+/// resolve cleanly without entering `handle_ingress_fallback`.
+fn mount_console_route(
+    router: Router<ConsoleApiState>,
+    path: &str,
+    method_router: axum::routing::MethodRouter<ConsoleApiState>,
+) -> Router<ConsoleApiState> {
+    let router = router.route(path, method_router.clone());
+    if path.len() > 1 && !path.ends_with('/') {
+        router.route(&format!("{path}/"), method_router)
+    } else {
+        router
+    }
+}
+
+fn mount_console_routes(
+    mut router: Router<ConsoleApiState>,
+    paths: &[&str],
+    method_router: axum::routing::MethodRouter<ConsoleApiState>,
+) -> Router<ConsoleApiState> {
+    for path in paths {
+        router = mount_console_route(router, path, method_router.clone());
+    }
+    router
+}
+
 /// Builds the console router directly from a preconstructed [`ConsoleApiState`].
 pub fn build_console_api_router_with_state(state: ConsoleApiState) -> Router {
-    Router::new()
-        // Smartscape topology
-        .route("/api/v1/smartscape", get(handle_get_smartscape))
-        .route("/api/v1/console/smartscape", get(handle_get_smartscape))
-        .route("/api/observe/smartscape", get(handle_get_smartscape))
-        .route("/api/smartscape", get(handle_get_smartscape))
-        // Deterministic SLO problems & SSE feed
-        .route("/api/v1/problems", get(handle_get_problems))
-        .route("/api/v1/console/problems", get(handle_get_problems))
-        .route("/api/observe/problems", get(handle_get_problems))
-        .route("/api/problems", get(handle_get_problems))
-        .route("/api/v1/events", get(handle_get_problem_events_sse))
-        .route("/api/observe/events", get(handle_get_problem_events_sse))
-        .route("/api/events", get(handle_get_problem_events_sse))
-        // PurePath traces list & waterfall
-        .route("/api/v1/traces", get(handle_get_traces))
-        .route("/api/v1/console/traces", get(handle_get_traces))
-        .route("/api/observe/traces", get(handle_get_traces))
-        .route("/api/traces", get(handle_get_traces))
-        .route("/api/v1/traces/{trace_id}", get(handle_get_trace_purepath))
-        .route(
+    let mut router = Router::new();
+    // Smartscape topology
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/smartscape",
+            "/api/v1/console/smartscape",
+            "/api/observe/smartscape",
+            "/api/smartscape",
+            "/api/obs/v1/smartscape",
+        ],
+        get(handle_get_smartscape),
+    );
+    // Deterministic SLO problems & SSE feed
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/problems",
+            "/api/v1/console/problems",
+            "/api/observe/problems",
+            "/api/problems",
+            "/api/obs/v1/problems",
+        ],
+        get(handle_get_problems),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/events",
+            "/api/observe/events",
+            "/api/events",
+            "/api/obs/v1/events",
+        ],
+        get(handle_get_problem_events_sse),
+    );
+    // PurePath traces list & waterfall
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/traces",
+            "/api/v1/console/traces",
+            "/api/observe/traces",
+            "/api/traces",
+            "/api/obs/v1/traces",
+        ],
+        get(handle_get_traces),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/traces/{trace_id}",
             "/api/v1/traces/{trace_id}/purepath",
-            get(handle_get_trace_purepath),
-        )
-        .route(
             "/api/v1/console/traces/{trace_id}",
-            get(handle_get_trace_purepath),
-        )
-        .route(
             "/api/v1/console/traces/{trace_id}/purepath",
-            get(handle_get_trace_purepath),
-        )
-        .route(
             "/api/observe/traces/{trace_id}",
-            get(handle_get_trace_purepath),
-        )
-        .route(
             "/api/observe/traces/{trace_id}/purepath",
-            get(handle_get_trace_purepath),
-        )
-        .route("/api/traces/{trace_id}", get(handle_get_trace_purepath))
-        .route(
+            "/api/traces/{trace_id}",
             "/api/traces/{trace_id}/purepath",
-            get(handle_get_trace_purepath),
-        )
-        // Fixed-filter structured logs & CI job log stream
-        .route("/api/v1/logs", get(handle_get_logs))
-        .route("/api/v1/console/logs", get(handle_get_logs))
-        .route("/api/observe/logs", get(handle_get_logs))
-        .route("/api/logs", get(handle_get_logs))
-        // Sanitized per-job CI build log endpoint for anonymous/public access
-        .route("/api/v1/jobs/{job_id}/log", get(handle_get_job_log))
-        .route("/api/v1/jobs/{job_id}/logs", get(handle_get_job_log))
-        .route("/api/v1/console/jobs/{job_id}/log", get(handle_get_job_log))
-        .route(
-            "/api/v1/console/jobs/{job_id}/logs",
-            get(handle_get_job_log),
-        )
-        .route("/api/observe/jobs/{job_id}/log", get(handle_get_job_log))
-        .route("/api/observe/jobs/{job_id}/logs", get(handle_get_job_log))
-        .route("/api/jobs/{job_id}/log", get(handle_get_job_log))
-        .route("/api/jobs/{job_id}/logs", get(handle_get_job_log))
-        // Fixed-filter metrics timeseries & cluster efficiency
-        .route("/api/v1/metrics/timeseries", get(handle_get_metrics))
-        .route("/api/v1/metrics", get(handle_get_metrics))
-        .route("/api/v1/console/metrics", get(handle_get_metrics))
-        .route(
-            "/api/v1/console/metrics/timeseries",
-            get(handle_get_metrics),
-        )
-        .route("/api/observe/metrics", get(handle_get_metrics))
-        .route("/api/metrics", get(handle_get_metrics))
-        .route("/api/metrics/timeseries", get(handle_get_metrics))
-        // Sanitized storage health status
-        .route("/api/v1/store/status", get(handle_get_store_status))
-        .route("/api/v1/datastore", get(handle_get_store_status))
-        .route("/api/v1/console/store/status", get(handle_get_store_status))
-        .route("/api/v1/console/datastore", get(handle_get_store_status))
-        .route("/api/observe/datastore", get(handle_get_store_status))
-        .route("/api/observe/store/status", get(handle_get_store_status))
-        .route("/api/store/status", get(handle_get_store_status))
-        .route("/api/datastore", get(handle_get_store_status))
-        // Ingress reverse proxy routes, upstreams, overview & dynamic configuration
-        .route(
-            "/api/v1/ingress/routes",
-            get(handle_get_ingress_routes).post(handle_post_ingress_route),
-        )
-        .route(
-            "/api/observe/ingress/routes",
-            get(handle_get_ingress_routes).post(handle_post_ingress_route),
-        )
-        .route(
-            "/api/ingress/routes",
-            get(handle_get_ingress_routes).post(handle_post_ingress_route),
-        )
-        .route("/api/v1/ingress/tls", post(handle_post_ingress_tls))
-        .route("/api/observe/ingress/tls", post(handle_post_ingress_tls))
-        .route("/api/ingress/tls", post(handle_post_ingress_tls))
-        .route(
-            "/api/v1/ingress/upstreams",
-            get(handle_get_ingress_upstreams),
-        )
-        .route(
-            "/api/observe/ingress/upstreams",
-            get(handle_get_ingress_upstreams),
-        )
-        .route("/api/ingress/upstreams", get(handle_get_ingress_upstreams))
-        .route("/api/v1/ingress/overview", get(handle_get_ingress_overview))
-        // Unified 7-subsystem operational status & maintenance override controls
-        .route("/api/v1/status/subsystems", get(handle_get_subsystems))
-        .route(
-            "/api/v1/console/status/subsystems",
-            get(handle_get_subsystems),
-        )
-        .route("/api/observe/status/subsystems", get(handle_get_subsystems))
-        .route("/api/status/subsystems", get(handle_get_subsystems))
-        .route("/api/obs/v1/status/subsystems", get(handle_get_subsystems))
-        .route(
-            "/api/v1/status/subsystems/{id}/maintenance",
-            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
-        )
-        .route(
-            "/api/v1/console/status/subsystems/{id}/maintenance",
-            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
-        )
-        .route(
-            "/api/observe/status/subsystems/{id}/maintenance",
-            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
-        )
-        .route(
-            "/api/status/subsystems/{id}/maintenance",
-            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
-        )
-        .route(
-            "/api/obs/v1/status/subsystems/{id}/maintenance",
-            put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
-        )
-        .route(
-            "/api/observe/ingress/overview",
-            get(handle_get_ingress_overview),
-        )
-        .route("/api/ingress/overview", get(handle_get_ingress_overview))
-        // Log aggregations / facets / histograms
-        .route("/api/v1/logs/facets", get(handle_get_log_facets))
-        .route("/api/obs/v1/logs/facets", get(handle_get_log_facets))
-        .route("/api/observe/logs/facets", get(handle_get_log_facets))
-        .route("/api/logs/facets", get(handle_get_log_facets))
-        .route("/api/v1/logs/aggregations", get(handle_get_log_facets))
-        .route("/api/obs/v1/logs/aggregations", get(handle_get_log_facets))
-        // Direct native /api/obs/v1/* route mounts preventing proxy loop
-        .route("/api/obs/v1/smartscape", get(handle_get_smartscape))
-        .route("/api/obs/v1/problems", get(handle_get_problems))
-        .route("/api/obs/v1/events", get(handle_get_problem_events_sse))
-        .route("/api/obs/v1/traces", get(handle_get_traces))
-        .route(
             "/api/obs/v1/traces/{trace_id}",
-            get(handle_get_trace_purepath),
-        )
-        .route(
             "/api/obs/v1/traces/{trace_id}/purepath",
-            get(handle_get_trace_purepath),
-        )
-        .route("/api/obs/v1/logs", get(handle_get_logs))
-        .route("/api/obs/v1/jobs/{job_id}/log", get(handle_get_job_log))
-        .route("/api/obs/v1/jobs/{job_id}/logs", get(handle_get_job_log))
-        .route("/api/obs/v1/metrics", get(handle_get_metrics))
-        .route("/api/obs/v1/metrics/timeseries", get(handle_get_metrics))
-        .route("/api/obs/v1/store/status", get(handle_get_store_status))
-        .route("/api/obs/v1/datastore", get(handle_get_store_status))
-        .route(
+        ],
+        get(handle_get_trace_purepath),
+    );
+    // Fixed-filter structured logs, facets & CI job log stream
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/logs",
+            "/api/v1/console/logs",
+            "/api/observe/logs",
+            "/api/logs",
+            "/api/obs/v1/logs",
+        ],
+        get(handle_get_logs),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/logs/facets",
+            "/api/obs/v1/logs/facets",
+            "/api/observe/logs/facets",
+            "/api/logs/facets",
+            "/api/v1/logs/aggregations",
+            "/api/obs/v1/logs/aggregations",
+        ],
+        get(handle_get_log_facets),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/jobs/{job_id}/log",
+            "/api/v1/jobs/{job_id}/logs",
+            "/api/v1/console/jobs/{job_id}/log",
+            "/api/v1/console/jobs/{job_id}/logs",
+            "/api/observe/jobs/{job_id}/log",
+            "/api/observe/jobs/{job_id}/logs",
+            "/api/jobs/{job_id}/log",
+            "/api/jobs/{job_id}/logs",
+            "/api/obs/v1/jobs/{job_id}/log",
+            "/api/obs/v1/jobs/{job_id}/logs",
+        ],
+        get(handle_get_job_log),
+    );
+    // Fixed-filter metrics timeseries & cluster efficiency
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/metrics/timeseries",
+            "/api/v1/metrics",
+            "/api/v1/console/metrics",
+            "/api/v1/console/metrics/timeseries",
+            "/api/observe/metrics",
+            "/api/metrics",
+            "/api/metrics/timeseries",
+            "/api/obs/v1/metrics",
+            "/api/obs/v1/metrics/timeseries",
+        ],
+        get(handle_get_metrics),
+    );
+    // Sanitized storage health status
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/store/status",
+            "/api/v1/datastore",
+            "/api/v1/console/store/status",
+            "/api/v1/console/datastore",
+            "/api/observe/datastore",
+            "/api/observe/store/status",
+            "/api/store/status",
+            "/api/datastore",
+            "/api/obs/v1/store/status",
+            "/api/obs/v1/datastore",
+        ],
+        get(handle_get_store_status),
+    );
+    // Ingress reverse proxy routes, upstreams, overview & dynamic configuration
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/ingress/routes",
+            "/api/observe/ingress/routes",
+            "/api/ingress/routes",
             "/api/obs/v1/ingress/routes",
-            get(handle_get_ingress_routes).post(handle_post_ingress_route),
-        )
-        .route("/api/obs/v1/ingress/tls", post(handle_post_ingress_tls))
-        .route(
+        ],
+        get(handle_get_ingress_routes).post(handle_post_ingress_route),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/ingress/tls",
+            "/api/observe/ingress/tls",
+            "/api/ingress/tls",
+            "/api/obs/v1/ingress/tls",
+        ],
+        post(handle_post_ingress_tls),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/ingress/upstreams",
+            "/api/observe/ingress/upstreams",
+            "/api/ingress/upstreams",
             "/api/obs/v1/ingress/upstreams",
-            get(handle_get_ingress_upstreams),
-        )
-        .route(
+        ],
+        get(handle_get_ingress_upstreams),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/ingress/overview",
+            "/api/observe/ingress/overview",
+            "/api/ingress/overview",
             "/api/obs/v1/ingress/overview",
-            get(handle_get_ingress_overview),
-        )
-        .fallback(handle_ingress_fallback)
-        .with_state(state)
+        ],
+        get(handle_get_ingress_overview),
+    );
+    // Unified 7-subsystem operational status & maintenance override controls
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/status/subsystems",
+            "/api/v1/console/status/subsystems",
+            "/api/observe/status/subsystems",
+            "/api/status/subsystems",
+            "/api/obs/v1/status/subsystems",
+        ],
+        get(handle_get_subsystems),
+    );
+    router = mount_console_routes(
+        router,
+        &[
+            "/api/v1/status/subsystems/{id}/maintenance",
+            "/api/v1/console/status/subsystems/{id}/maintenance",
+            "/api/observe/status/subsystems/{id}/maintenance",
+            "/api/status/subsystems/{id}/maintenance",
+            "/api/obs/v1/status/subsystems/{id}/maintenance",
+        ],
+        put(handle_put_subsystem_maintenance).delete(handle_delete_subsystem_maintenance),
+    );
+
+    router.fallback(handle_ingress_fallback).with_state(state)
 }
 
 async fn handle_get_smartscape(
@@ -2353,5 +2397,91 @@ mod tests {
             validate_safe_filter_token(&over_256),
             Err("Filter parameter exceeds maximum length (256)")
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_trailing_slash_native_routes_and_unmounted_obs_paths_avoid_508_loop() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        let ingress = IngressEngine::new(store.clone(), "node-a".into());
+        let router = build_console_api_router_with_ingress(store.clone(), ingress.clone());
+
+        for path in [
+            "/api/obs/v1/status/subsystems/",
+            "/api/v1/status/subsystems/",
+            "/api/obs/v1/smartscape/",
+            "/api/v1/smartscape/",
+            "/api/obs/v1/problems/",
+            "/api/v1/problems/",
+            "/api/obs/v1/traces/",
+            "/api/v1/traces/",
+            "/api/obs/v1/logs/",
+            "/api/v1/logs/",
+            "/api/obs/v1/logs/facets/",
+            "/api/v1/logs/facets/",
+            "/api/obs/v1/metrics/",
+            "/api/v1/metrics/timeseries/",
+            "/api/obs/v1/store/status/",
+            "/api/v1/store/status/",
+            "/api/obs/v1/ingress/overview/",
+            "/api/v1/ingress/overview/",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router oneshot");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "trailing-slash native endpoint {path} must resolve with 200 OK"
+            );
+        }
+
+        // Unmounted /api/obs/v1/* paths must return 404 Not Found rather than 508 Loop Detected
+        for unmounted in [
+            "/api/obs/v1/causal-problems",
+            "/api/obs/v1/diagnosis/problems",
+            "/api/obs/v1/nonexistent/",
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(unmounted)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router oneshot");
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "unmounted path {unmounted} must return 404 Not Found"
+            );
+        }
+
+        // Verify zero mu-ingress spans (including ERROR spans) were created by trailing-slash
+        // native mounts or unmounted /api/obs/* self-proxy guards.
+        let conn = store.lock_conn().expect("lock conn");
+        let ingress_span_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM v_traces WHERE service_name = 'mu-ingress'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count mu-ingress spans");
+        assert_eq!(ingress_span_count, 0);
     }
 }

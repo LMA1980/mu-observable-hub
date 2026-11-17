@@ -286,6 +286,48 @@ pub fn build_sandbox_execution_plan(
     Ok(plan)
 }
 
+fn is_node_edge_collector(attr: &SanAttribution) -> bool {
+    attr.service_name.as_deref().is_some_and(|svc| {
+        svc.eq_ignore_ascii_case("muobserve-collector")
+            || svc.eq_ignore_ascii_case("mu-observable-collector")
+    })
+}
+
+fn has_non_empty_json_job_id(attributes_json: &str) -> bool {
+    let trimmed = attributes_json.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed)
+    else {
+        return false;
+    };
+    map.get("job_id")
+        .or_else(|| map.get("ci.job_id"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+fn apply_san_policy_with_job_origin(
+    attribution: &SanAttribution,
+    policy: SanEnforcementPolicy,
+    node_id: &mut String,
+    service_name: &mut String,
+    has_job_id: bool,
+) -> Result<(), MuObserveError> {
+    let preserve_job_origin = policy == SanEnforcementPolicy::OverrideWithCertSan
+        && has_job_id
+        && !node_id.trim().is_empty();
+    if !preserve_job_origin {
+        enforce_san_on_item(attribution, policy, node_id, Some(service_name))?;
+    } else if service_name.trim().is_empty() {
+        if let Some(expected_svc) = attribution.service_name.as_ref() {
+            *service_name = expected_svc.clone();
+        }
+    }
+    Ok(())
+}
+
 /// Validates or overrides `node_id` and `service_name` on a batch item using [`SanAttribution`].
 fn enforce_san_on_item(
     attr: &SanAttribution,
@@ -318,7 +360,9 @@ fn enforce_san_on_item(
             if let (Some(batch_svc), Some(expected_svc)) =
                 (service_name, attr.service_name.as_ref())
             {
-                *batch_svc = expected_svc.clone();
+                if !is_node_edge_collector(attr) || batch_svc.trim().is_empty() {
+                    *batch_svc = expected_svc.clone();
+                }
             }
             Ok(())
         }
@@ -340,24 +384,14 @@ pub fn dispatch_frame(
             let mut entries = decode_log_batch(payload)?;
             let redactor = DeterministicSecretRedactor::new();
             for e in &mut entries {
-                let preserve_job_origin = e
-                    .job_id
-                    .as_deref()
-                    .map(|j| !j.trim().is_empty())
-                    .unwrap_or(false)
-                    && !e.node_id.trim().is_empty();
-                if !preserve_job_origin {
-                    enforce_san_on_item(
-                        attribution,
-                        config.san_policy,
-                        &mut e.node_id,
-                        Some(&mut e.service_name),
-                    )?;
-                } else if e.service_name.trim().is_empty() {
-                    if let Some(expected_svc) = attribution.service_name.as_ref() {
-                        e.service_name = expected_svc.clone();
-                    }
-                }
+                let has_job_id = e.job_id.as_deref().is_some_and(|j| !j.trim().is_empty());
+                apply_san_policy_with_job_origin(
+                    attribution,
+                    config.san_policy,
+                    &mut e.node_id,
+                    &mut e.service_name,
+                    has_job_id,
+                )?;
                 if config.redact_on_ingest {
                     e.redact_in_place(&redactor);
                 }
@@ -369,11 +403,13 @@ pub fn dispatch_frame(
             let mut entries = decode_span_batch(payload)?;
             let redactor = DeterministicSecretRedactor::new();
             for e in &mut entries {
-                enforce_san_on_item(
+                let has_job_id = has_non_empty_json_job_id(&e.attributes_json);
+                apply_san_policy_with_job_origin(
                     attribution,
                     config.san_policy,
                     &mut e.node_id,
-                    Some(&mut e.service_name),
+                    &mut e.service_name,
+                    has_job_id,
                 )?;
                 if config.redact_on_ingest {
                     e.redact_in_place(&redactor);
@@ -855,5 +891,330 @@ mod tests {
             .expect("build KernelSandbox plan");
         assert_eq!(plan.backend, SandboxBackendKind::Kernel);
         assert!(!plan.landlock_rules.is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_collector_san_preserves_forwarded_service_name_across_logs_spans_and_metrics() {
+        use mu_observable_ipc::{
+            encode_log_batch, encode_metric_batch, encode_span_batch, OtelLogEntry,
+            OtelMetricEntry, OtelSpanEntry,
+        };
+
+        for collector_svc in ["muobserve-collector", "mu-observable-collector"] {
+            let store = HotDuckDbStore::open_in_memory().expect("open store");
+            let collector_attr = SanAttribution {
+                raw_sans: vec![format!("{collector_svc}.node-a.cluster.internal")],
+                node_id: "node-a".into(),
+                service_name: Some(collector_svc.into()),
+            };
+            let override_cfg = IngestServerConfig {
+                san_policy: SanEnforcementPolicy::OverrideWithCertSan,
+                redact_on_ingest: true,
+                allowed_dns_suffix: Some("cluster.internal".into()),
+            };
+
+            let logs = vec![
+                OtelLogEntry {
+                    timestamp_unix_nano: 1_700_000_100_000_000_000,
+                    trace_id: "tr-sent-1".into(),
+                    span_id: "sp-sent-1".into(),
+                    severity_number: 13,
+                    severity_text: "WARN".into(),
+                    service_name: "musentinel".into(),
+                    node_id: "spoofed-local-host".into(),
+                    body: "psi_dstate alert".into(),
+                    attributes_json: "{}".into(),
+                    job_id: None,
+                    stage_id: None,
+                },
+                OtelLogEntry {
+                    timestamp_unix_nano: 1_700_000_100_000_000_001,
+                    trace_id: "tr-sent-1".into(),
+                    span_id: "sp-sent-2".into(),
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    service_name: "   ".into(),
+                    node_id: "spoofed-local-host".into(),
+                    body: "collector heartbeat".into(),
+                    attributes_json: "{}".into(),
+                    job_id: None,
+                    stage_id: None,
+                },
+            ];
+            let log_payload = encode_log_batch(&logs).expect("encode logs");
+            let log_hdr = IpcHeader::new(MSG_TYPE_ARROW_LOGS, log_payload.len() as u32, 0, 1);
+            dispatch_frame(
+                &store,
+                &override_cfg,
+                &collector_attr,
+                &log_hdr,
+                &log_payload,
+            )
+            .expect("dispatch collector logs");
+
+            let spans = vec![OtelSpanEntry {
+                trace_id: "tr-sent-1".into(),
+                span_id: "sp-sent-1".into(),
+                parent_span_id: None,
+                service_name: "musentinel".into(),
+                node_id: "spoofed-local-host".into(),
+                span_name: "sentinel.psi.sample".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: 1_700_000_100_000_000_000,
+                end_time_unix_nano: 1_700_000_100_001_000_000,
+                duration_ns: 1_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            }];
+            let span_payload = encode_span_batch(&spans).expect("encode spans");
+            let span_hdr = IpcHeader::new(MSG_TYPE_ARROW_SPANS, span_payload.len() as u32, 0, 2);
+            dispatch_frame(
+                &store,
+                &override_cfg,
+                &collector_attr,
+                &span_hdr,
+                &span_payload,
+            )
+            .expect("dispatch collector spans");
+
+            let metrics = vec![OtelMetricEntry {
+                timestamp_unix_nano: 1_700_000_100_000_000_000,
+                service_name: "musentinel".into(),
+                node_id: "spoofed-local-host".into(),
+                metric_name: "cpu.utilization".into(),
+                metric_unit: "pct".into(),
+                value_f64: 12.5,
+                arch: "x86_64".into(),
+                cpu_cluster: None,
+                vlen_bits: None,
+                memlock_used_bytes: None,
+                memlock_limit_bytes: None,
+                trace_id: None,
+                span_id: None,
+                attributes_json: "{}".into(),
+            }];
+            let metric_payload = encode_metric_batch(&metrics).expect("encode metrics");
+            let metric_hdr =
+                IpcHeader::new(MSG_TYPE_ARROW_METRICS, metric_payload.len() as u32, 0, 3);
+            dispatch_frame(
+                &store,
+                &override_cfg,
+                &collector_attr,
+                &metric_hdr,
+                &metric_payload,
+            )
+            .expect("dispatch collector metrics");
+
+            let conn = store.lock_conn().expect("lock conn");
+            let (log_svc, log_node): (String, String) = conn
+                .query_row(
+                    "SELECT service_name, node_id FROM v_logs WHERE span_id = 'sp-sent-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("query musentinel log");
+            assert_eq!(log_svc, "musentinel");
+            assert_eq!(log_node, "node-a");
+
+            let fallback_svc: String = conn
+                .query_row(
+                    "SELECT service_name FROM v_logs WHERE span_id = 'sp-sent-2'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("query empty service_name fallback log");
+            assert_eq!(fallback_svc, collector_svc);
+
+            let (span_svc, span_node): (String, String) = conn
+                .query_row(
+                    "SELECT service_name, node_id FROM v_traces WHERE span_id = 'sp-sent-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("query musentinel span");
+            assert_eq!(span_svc, "musentinel");
+            assert_eq!(span_node, "node-a");
+
+            let (metric_svc, metric_node): (String, String) = conn
+                .query_row("SELECT service_name, node_id FROM v_metrics", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .expect("query musentinel metric");
+            assert_eq!(metric_svc, "musentinel");
+            assert_eq!(metric_node, "node-a");
+            drop(conn);
+
+            // Direct non-collector service SAN still overrides service_name under OverrideWithCertSan
+            let direct_attr = SanAttribution {
+                raw_sans: vec!["k3-manager.node-a.cluster.internal".into()],
+                node_id: "node-a".into(),
+                service_name: Some("k3-manager".into()),
+            };
+            let direct_span = encode_span_batch(&[OtelSpanEntry {
+                span_id: "sp-direct-1".into(),
+                service_name: "spoofed-service".into(),
+                ..spans[0].clone()
+            }])
+            .unwrap();
+            let direct_hdr = IpcHeader::new(MSG_TYPE_ARROW_SPANS, direct_span.len() as u32, 0, 4);
+            dispatch_frame(
+                &store,
+                &override_cfg,
+                &direct_attr,
+                &direct_hdr,
+                &direct_span,
+            )
+            .expect("dispatch direct span");
+            let conn = store.lock_conn().expect("lock conn");
+            let direct_svc: String = conn
+                .query_row(
+                    "SELECT service_name FROM v_traces WHERE span_id = 'sp-direct-1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(direct_svc, "k3-manager");
+            drop(conn);
+
+            // RejectMismatch remains fail-closed for mismatched service_name
+            let reject_cfg = IngestServerConfig {
+                san_policy: SanEnforcementPolicy::RejectMismatch,
+                redact_on_ingest: true,
+                allowed_dns_suffix: Some("cluster.internal".into()),
+            };
+            let mismatched_span = encode_span_batch(&[OtelSpanEntry {
+                node_id: "node-a".into(),
+                service_name: "musentinel".into(),
+                ..spans[0].clone()
+            }])
+            .unwrap();
+            let reject_hdr =
+                IpcHeader::new(MSG_TYPE_ARROW_SPANS, mismatched_span.len() as u32, 0, 5);
+            let res = dispatch_frame(
+                &store,
+                &reject_cfg,
+                &direct_attr,
+                &reject_hdr,
+                &mismatched_span,
+            );
+            assert!(matches!(res, Err(MuObserveError::SanViolation(_))));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_ci_job_span_preserve_job_origin_parity() {
+        use mu_observable_ipc::{encode_span_batch, OtelSpanEntry};
+
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        let attr = SanAttribution {
+            raw_sans: vec!["action-runner-controller.node-a.cluster.internal".into()],
+            node_id: "node-a".into(),
+            service_name: Some("action-runner-controller".into()),
+        };
+        let override_cfg = IngestServerConfig {
+            san_policy: SanEnforcementPolicy::OverrideWithCertSan,
+            redact_on_ingest: true,
+            allowed_dns_suffix: Some("cluster.internal".into()),
+        };
+
+        let ci_spans = vec![
+            OtelSpanEntry {
+                trace_id: "tr-ci-1".into(),
+                span_id: "sp-ci-ctrl".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "controller".into(),
+                span_name: "ci.pipeline.run:repo".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: 1_700_000_200_000_000_000,
+                end_time_unix_nano: 1_700_000_205_000_000_000,
+                duration_ns: 5_000_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: r#"{"job_id":"job-1","repo":"LMA1980/mu-observable-hub"}"#.into(),
+            },
+            OtelSpanEntry {
+                trace_id: "tr-ci-1".into(),
+                span_id: "sp-ci-worker".into(),
+                parent_span_id: Some("sp-ci-ctrl".into()),
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-riscv64".into(),
+                span_name: "ci.stage.dispatch:test-check".into(),
+                span_kind: "CLIENT".into(),
+                start_time_unix_nano: 1_700_000_201_000_000_000,
+                end_time_unix_nano: 1_700_000_204_000_000_000,
+                duration_ns: 3_000_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: r#"{"job_id":"job-1","stage_id":"test-check"}"#.into(),
+            },
+            // Non-job span (empty job_id) must still be overridden to cert SAN
+            OtelSpanEntry {
+                trace_id: "tr-ci-1".into(),
+                span_id: "sp-non-job".into(),
+                parent_span_id: None,
+                service_name: "spoofed-svc".into(),
+                node_id: "spoofed-node".into(),
+                span_name: "non.job.op".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: 1_700_000_200_000_000_000,
+                end_time_unix_nano: 1_700_000_200_100_000_000,
+                duration_ns: 100_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: r#"{"job_id":"   "}"#.into(),
+            },
+        ];
+
+        let payload = encode_span_batch(&ci_spans).expect("encode spans");
+        let hdr = IpcHeader::new(MSG_TYPE_ARROW_SPANS, payload.len() as u32, 0, 10);
+        dispatch_frame(&store, &override_cfg, &attr, &hdr, &payload)
+            .expect("dispatch ci job spans");
+
+        let conn = store.lock_conn().expect("lock conn");
+        let (ctrl_svc, ctrl_node): (String, String) = conn
+            .query_row(
+                "SELECT service_name, node_id FROM v_traces WHERE span_id = 'sp-ci-ctrl'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ctrl_svc, "mu-ci-controller");
+        assert_eq!(ctrl_node, "controller");
+
+        let (wrk_svc, wrk_node): (String, String) = conn
+            .query_row(
+                "SELECT service_name, node_id FROM v_traces WHERE span_id = 'sp-ci-worker'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(wrk_svc, "mu-ci-worker");
+        assert_eq!(wrk_node, "worker-riscv64");
+
+        let (non_job_svc, non_job_node): (String, String) = conn
+            .query_row(
+                "SELECT service_name, node_id FROM v_traces WHERE span_id = 'sp-non-job'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(non_job_svc, "action-runner-controller");
+        assert_eq!(non_job_node, "node-a");
+        drop(conn);
+
+        // RejectMismatch remains fail-closed even when job_id is present in attributes_json
+        let reject_cfg = IngestServerConfig {
+            san_policy: SanEnforcementPolicy::RejectMismatch,
+            redact_on_ingest: true,
+            allowed_dns_suffix: Some("cluster.internal".into()),
+        };
+        let reject_payload = encode_span_batch(&ci_spans[..1]).unwrap();
+        let reject_hdr = IpcHeader::new(MSG_TYPE_ARROW_SPANS, reject_payload.len() as u32, 0, 11);
+        let res = dispatch_frame(&store, &reject_cfg, &attr, &reject_hdr, &reject_payload);
+        assert!(matches!(res, Err(MuObserveError::SanViolation(_))));
     }
 }
