@@ -2288,15 +2288,61 @@ fn parse_ci_job_log_line(line: &str) -> ParsedCiLogLine {
     }
 }
 
+fn has_nonzero_failed_token(lower: &str) -> bool {
+    let mut start = 0;
+    while let Some(rel) = lower[start..].find("failed") {
+        let idx = start + rel;
+        let prefix = lower[..idx].trim_end_matches([' ', '\t']);
+        let is_zero_prefix = prefix.ends_with('0')
+            && !prefix
+                .as_bytes()
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(u8::is_ascii_digit);
+        if !is_zero_prefix {
+            return true;
+        }
+        start = idx + "failed".len();
+    }
+    false
+}
+
+fn has_nonzero_exit_status(lower: &str) -> bool {
+    if let Some(idx) = lower.find("exit_code=some(") {
+        let rest = &lower[idx + "exit_code=some(".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() && digits.parse::<i64>().is_ok_and(|code| code != 0) {
+            return true;
+        }
+    }
+    if let Some(idx) = lower.find("exited with status code") {
+        let rest = lower[idx + "exited with status code".len()..].trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() || digits.parse::<i64>().is_ok_and(|code| code != 0) {
+            return true;
+        }
+    }
+    false
+}
+
 fn classify_ci_log_severity(line: &str, is_stderr: bool) -> (i32, &'static str) {
     let lower = line.to_ascii_lowercase();
+    let trimmed_lower = lower.trim_end();
+    if trimmed_lower.ends_with("... ok")
+        || trimmed_lower.ends_with("... ignored")
+        || (lower.contains("test result: ok") && !lower.contains("test result: failed"))
+    {
+        return (9, "INFO");
+    }
+
     if lower.contains("error:")
         || lower.contains("error[")
         || lower.contains("panicked at")
-        || lower.contains("exited with status code")
         || lower.contains("test result: failed")
-        || lower.contains("exit_code=some(1")
-        || (is_stderr && (lower.contains("failed") || lower.contains("fatal")))
+        || trimmed_lower.ends_with("... failed")
+        || has_nonzero_exit_status(&lower)
+        || (is_stderr && (has_nonzero_failed_token(&lower) || lower.contains("fatal")))
     {
         (17, "ERROR")
     } else if lower.contains("warning:") || lower.contains("[warn]") {
@@ -2354,13 +2400,18 @@ fn split_legacy_job_log_snapshot(snap: &CentralSubmoduleSnapshot) -> Vec<OtelLog
             "job_id": canonical_job_id,
             "stage_id": parsed.stage_id,
         });
+        let service_name = if parsed.node_id.eq_ignore_ascii_case("controller") {
+            "mu-ci-controller"
+        } else {
+            "mu-ci-worker"
+        };
         entries.push(OtelLogEntry {
             timestamp_unix_nano: ts_ns,
             trace_id: ci_trace_id.clone(),
             span_id,
             severity_number: sev_num,
             severity_text: sev_txt.to_string(),
-            service_name: "actionrunner-rs".to_string(),
+            service_name: service_name.to_string(),
             node_id: parsed.node_id,
             body: parsed.body,
             attributes_json: attrs.to_string(),
@@ -2999,5 +3050,125 @@ mod tests {
 
         // Verify statvfs helper returns Some(> 0) on the tempdir path
         assert!(available_disk_bytes(dir.path()).unwrap_or(1) > 0);
+    }
+
+    #[test]
+    fn test_classify_ci_log_severity_and_canonical_service_attribution() {
+        // Passing Cargo test summaries and passing test names containing "failed"/"fatal"/"error"
+        // on stderr must classify as INFO, not ERROR.
+        assert_eq!(
+            classify_ci_log_severity(
+                "[coverage-check] test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+                true,
+            ),
+            (9, "INFO")
+        );
+        assert_eq!(
+            classify_ci_log_severity(
+                "[coverage-check] test tests::operator_restart_job_dispatches_post_and_transitions_failed_stages ... ok",
+                true,
+            ),
+            (9, "INFO")
+        );
+        assert_eq!(
+            classify_ci_log_severity(
+                "[test-check] test tests::handles_fatal_error_panic ... ok",
+                true,
+            ),
+            (9, "INFO")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[coverage-check] 12 passed; 0 failed", true),
+            (9, "INFO")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[test-check] Process exited with status code 0", true),
+            (9, "INFO")
+        );
+
+        // Genuine failures MUST classify as ERROR
+        assert_eq!(
+            classify_ci_log_severity(
+                "[test-check] test result: FAILED. 10 passed; 1 failed; 0 ignored",
+                true,
+            ),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[test-check] 10 passed; 10 failed", true),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[build-check] error[E0308]: mismatched types", true),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[build-check] error: could not compile crate", true),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity(
+                "[test-check] thread 'main' panicked at src/lib.rs:10:5:",
+                true,
+            ),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[test-check] stage exit_code=Some(101)", false),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[test-check] fatal: repository not found", true),
+            (17, "ERROR")
+        );
+        assert_eq!(
+            classify_ci_log_severity("[clippy-check] warning: unused variable", true),
+            (13, "WARN")
+        );
+
+        // Verify split_legacy_job_log_snapshot emits canonical service_name ("mu-ci-worker" /
+        // "mu-ci-controller") instead of legacy "actionrunner-rs" and preserves INFO severity.
+        let raw_log = [
+            "Job queued on controller",
+            "2026-11-15T12:00:01Z [worker-riscv64] [coverage-check] [stderr] test tests::operator_restart_job_dispatches_post_and_transitions_failed_stages ... ok",
+            "2026-11-15T12:00:02Z [worker-riscv64] [coverage-check] [stderr] test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+            "2026-11-15T12:00:03Z [worker-riscv64] [test-check] [stderr] error: test failed with exit_code=Some(101)",
+        ]
+        .join("\n");
+
+        let snap = CentralSubmoduleSnapshot {
+            parent_repo_key: "__ar_job_logs__".into(),
+            branch_key: "log".into(),
+            submodule_key: "job-123456".into(),
+            submodule_path_key: "log".into(),
+            latest_active_job_id: Some("job-123456".into()),
+            latest_active_json: Some(raw_log),
+            latest_active_queued_us: Some(1_700_000_000_000_000),
+            latest_completed_job_id: None,
+            latest_completed_json: None,
+            latest_completed_queued_us: None,
+        };
+
+        let entries = split_legacy_job_log_snapshot(&snap);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].node_id, "controller");
+        assert_eq!(entries[0].service_name, "mu-ci-controller");
+        assert_eq!(entries[0].severity_text, "INFO");
+
+        assert_eq!(entries[1].node_id, "worker-riscv64");
+        assert_eq!(entries[1].service_name, "mu-ci-worker");
+        assert_eq!(entries[1].severity_text, "INFO");
+        assert_eq!(entries[1].severity_number, 9);
+
+        assert_eq!(entries[2].node_id, "worker-riscv64");
+        assert_eq!(entries[2].service_name, "mu-ci-worker");
+        assert_eq!(entries[2].severity_text, "INFO");
+        assert_eq!(entries[2].severity_number, 9);
+
+        assert_eq!(entries[3].service_name, "mu-ci-worker");
+        assert_eq!(entries[3].severity_text, "ERROR");
+        assert_eq!(entries[3].severity_number, 17);
+
+        assert!(entries.iter().all(|e| e.service_name != "actionrunner-rs"));
     }
 }
