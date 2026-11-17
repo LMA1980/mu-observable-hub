@@ -175,6 +175,27 @@ pub fn compute_test_flakiness(
     window_days: u32,
     now_unix_nano: Option<i64>,
 ) -> Result<Vec<TestRegressionItem>, MuObserveError> {
+    compute_test_flakiness_with_min_ts(
+        store,
+        repo_key,
+        candidate_commit,
+        window_days,
+        now_unix_nano,
+        None,
+    )
+}
+
+/// Computes rolling `window_days` test flakiness with an optional `min_timestamp_unix_nano`
+/// floor applied to `cutoff_ts` so pre-cutover test failures can be excluded from active alerts
+/// without modifying `test_case_runs` or `v_tests`.
+pub fn compute_test_flakiness_with_min_ts(
+    store: &HotDuckDbStore,
+    repo_key: &str,
+    candidate_commit: Option<&str>,
+    window_days: u32,
+    now_unix_nano: Option<i64>,
+    min_timestamp_unix_nano: Option<i64>,
+) -> Result<Vec<TestRegressionItem>, MuObserveError> {
     let conn = store.lock_conn()?;
 
     let max_ts: i64 = match now_unix_nano {
@@ -191,7 +212,10 @@ pub fn compute_test_flakiness(
     let window_ns = i64::from(window_days.max(1))
         .saturating_mul(86_400)
         .saturating_mul(1_000_000_000);
-    let cutoff_ts = max_ts.saturating_sub(window_ns);
+    let mut cutoff_ts = max_ts.saturating_sub(window_ns);
+    if let Some(min_ts) = min_timestamp_unix_nano {
+        cutoff_ts = cutoff_ts.max(min_ts);
+    }
 
     let mut stmt = conn.prepare(
         r#"

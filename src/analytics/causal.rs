@@ -6,6 +6,7 @@
 //! call dependency graph to isolate the originating root-cause service, and correlates
 //! contemporaneous error logs from `v_logs`.
 
+use crate::analytics::exclusions::MonitoringExclusions;
 use crate::error::MuObserveError;
 use crate::server::sanitize::PrivacyRedactor;
 use crate::storage::HotDuckDbStore;
@@ -74,11 +75,25 @@ struct TraceSpanNode {
     status_code: String,
 }
 
-/// Computes causal root-cause problems across the active trace and log telemetry.
+/// Computes causal root-cause problems across the active trace and log telemetry,
+/// applying resolved [`MonitoringExclusions`].
 pub fn compute_causal_problems(
     store: &HotDuckDbStore,
     window_secs: u64,
     now_unix_nano: Option<i64>,
+) -> Result<Vec<CausalProblemCard>, MuObserveError> {
+    let exclusions = MonitoringExclusions::resolve(store);
+    compute_causal_problems_with_exclusions(store, window_secs, now_unix_nano, &exclusions)
+}
+
+/// Computes causal root-cause problems across the active trace and log telemetry with explicit
+/// [`MonitoringExclusions`], skipping retired services and applying `monitoring_since_unix_nano`
+/// as a floor on `cutoff_ts` while keeping `v_traces` and `v_logs` historical rows intact.
+pub fn compute_causal_problems_with_exclusions(
+    store: &HotDuckDbStore,
+    window_secs: u64,
+    now_unix_nano: Option<i64>,
+    exclusions: &MonitoringExclusions,
 ) -> Result<Vec<CausalProblemCard>, MuObserveError> {
     let bounded_window = window_secs.clamp(1, 604_800);
     let redactor = PrivacyRedactor::new();
@@ -110,7 +125,8 @@ pub fn compute_causal_problems(
         }
     };
 
-    let cutoff_ts = anchor_ts.saturating_sub((bounded_window as i64) * 1_000_000_000);
+    let cutoff_ts = exclusions
+        .apply_cutoff_floor(anchor_ts.saturating_sub((bounded_window as i64) * 1_000_000_000));
     let detected_at_ms = if anchor_ts > 0 {
         anchor_ts / 1_000_000
     } else {
@@ -135,6 +151,9 @@ pub fn compute_causal_problems(
     while let Some(row) = rows.next()? {
         let raw_svc: String = row.get(0)?;
         let svc = redactor.redact_str(&raw_svc);
+        if exclusions.is_service_excluded(&raw_svc) || exclusions.is_service_excluded(&svc) {
+            continue;
+        }
         let duration_ns: i64 = row.get(1)?;
         let status: String = row.get(2)?;
 

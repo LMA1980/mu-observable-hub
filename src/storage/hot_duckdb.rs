@@ -2027,7 +2027,7 @@ impl HotDuckDbStore {
                 latest_completed_job_id, latest_completed_json, latest_completed_queued_us
             FROM submodule_snapshots
             WHERE (?1 IS NULL OR parent_repo_key = ?1)
-              AND (?1 IS NOT NULL OR NOT starts_with(parent_repo_key, '__ar_'))
+              AND (?1 IS NOT NULL OR (NOT starts_with(parent_repo_key, '__ar_') AND NOT starts_with(parent_repo_key, '__muobserve_')))
               AND (?2 IS NULL OR submodule_key = ?2)
               AND (?3 IS NULL OR branch_key = ?3)
             ORDER BY parent_repo_key ASC, branch_key ASC, submodule_key ASC
