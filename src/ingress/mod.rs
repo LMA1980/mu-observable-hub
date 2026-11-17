@@ -6,7 +6,7 @@
 //! into DuckDB `HotDuckDbStore`), and TLS termination health telemetry.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -108,17 +108,34 @@ pub(crate) fn non_empty_env(key: &str) -> Option<String> {
 pub struct IngressEngine {
     store: HotDuckDbStore,
     node_id: String,
+    local_listen_addr: RwLock<String>,
+    obs_upstream_overridden: AtomicBool,
     routes: RwLock<Vec<Arc<IngressRouteState>>>,
     upstreams: RwLock<HashMap<String, Arc<IngressUpstreamState>>>,
     tls_health: RwLock<Option<TlsHealthDto>>,
 }
 
 impl IngressEngine {
-    /// Creates and initializes a new [`IngressEngine`].
+    /// Creates and initializes a new [`IngressEngine`] using `MUOBSERVE_MCP_HTTP_ADDR`
+    /// (defaulting to `127.0.0.1:9480`) as the local hub listener address for self-proxy guards.
     pub fn new(store: HotDuckDbStore, node_id: String) -> Arc<Self> {
+        let listen_addr =
+            non_empty_env("MUOBSERVE_MCP_HTTP_ADDR").unwrap_or_else(|| "127.0.0.1:9480".into());
+        Self::new_with_listen_addr(store, node_id, listen_addr)
+    }
+
+    /// Creates and initializes a new [`IngressEngine`] with an explicit local hub listener
+    /// address (`host:port`) used to prevent self-referential proxying loops.
+    pub fn new_with_listen_addr(
+        store: HotDuckDbStore,
+        node_id: String,
+        listen_addr: impl Into<String>,
+    ) -> Arc<Self> {
         let engine = Arc::new(Self {
             store,
             node_id,
+            local_listen_addr: RwLock::new(listen_addr.into()),
+            obs_upstream_overridden: AtomicBool::new(false),
             routes: RwLock::new(Vec::new()),
             upstreams: RwLock::new(HashMap::new()),
             tls_health: RwLock::new(None),
@@ -126,6 +143,12 @@ impl IngressEngine {
 
         engine.register_default_routes_sync();
         engine
+    }
+
+    /// Updates the local hub listener address (`host:port`) used by the self-proxy guard.
+    pub fn set_local_listen_addr(&self, listen_addr: impl Into<String>) {
+        let mut guard = self.local_listen_addr.write().unwrap();
+        *guard = listen_addr.into();
     }
 
     /// Returns the canonical default ingress route definitions.
@@ -190,11 +213,20 @@ impl IngressEngine {
 
     fn register_default_routes_sync(&self) {
         let defaults = Self::default_routes();
+        let (_, _, self_port, _) = {
+            let local_addr = self.local_listen_addr.read().unwrap();
+            parse_host_port(&local_addr)
+        };
 
         let mut r_guard = self.routes.write().unwrap();
         let mut u_guard = self.upstreams.write().unwrap();
 
-        for (r_id, prefix, upstream_url, svc, strip, auth) in defaults {
+        for (r_id, prefix, default_upstream_url, svc, strip, auth) in defaults {
+            let upstream_url = if r_id == "route-obs" && self_port != 9480 {
+                format!("http://127.0.0.1:{self_port}/api/")
+            } else {
+                default_upstream_url
+            };
             r_guard.push(Arc::new(IngressRouteState {
                 route_id: r_id.into(),
                 path_prefix: prefix.into(),
@@ -237,6 +269,9 @@ impl IngressEngine {
         strip_prefix: bool,
         auth_required: bool,
     ) {
+        if route_id == "route-obs" {
+            self.obs_upstream_overridden.store(true, Ordering::Release);
+        }
         let mut r_guard = self.routes.write().unwrap();
         let mut u_guard = self.upstreams.write().unwrap();
 
@@ -455,6 +490,23 @@ impl IngressEngine {
                     .unwrap_or_default());
             }
         };
+
+        // 1b. Self-proxy guard: unmounted local paths (such as /api/obs/*) must return 404
+        // rather than forwarding to the hub's own local listener and triggering 508 + ERROR spans.
+        if self.is_self_referential_route(&route) {
+            return Ok(axum::response::Response::builder()
+                .status(axum::http::StatusCode::NOT_FOUND)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::CACHE_CONTROL, "no-store")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "error": format!("No route handler matches '{path}'"),
+                        "status": 404
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_default());
+        }
 
         // 2. Authentication gate: fail-closed mu-auth edge proxy / constant-time Bearer validation
         if route.auth_required {
@@ -678,6 +730,46 @@ impl IngressEngine {
 
         Ok(resp)
     }
+
+    fn is_self_referential_route(&self, route: &IngressRouteState) -> bool {
+        if route.route_id == "route-obs" && !self.obs_upstream_overridden.load(Ordering::Acquire) {
+            return true;
+        }
+        let local_addr = self.local_listen_addr.read().unwrap().clone();
+        let (_, self_host, self_port, _) = parse_host_port(&local_addr);
+        let (is_https, target_host, target_port, _) = parse_host_port(&route.upstream_url);
+        !is_https && target_port == self_port && is_local_or_matching_host(&target_host, &self_host)
+    }
+}
+
+fn is_loopback_or_unspecified_host(host: &str) -> bool {
+    let norm = host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    if matches!(
+        norm.as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "0.0.0.0" | "::"
+    ) {
+        return true;
+    }
+    norm.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+fn is_local_or_matching_host(target_host: &str, self_host: &str) -> bool {
+    let target_norm = target_host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    let self_norm = self_host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    if target_norm == self_norm {
+        return true;
+    }
+    is_loopback_or_unspecified_host(&target_norm) && is_loopback_or_unspecified_host(&self_norm)
 }
 
 /// Active background probe runner monitoring upstream targets.
@@ -1020,5 +1112,102 @@ mod tests {
         assert_eq!(host, "2001:db8::1");
         assert_eq!(port, 8443);
         assert_eq!(base, "");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_route_obs_self_proxy_guard_returns_404_without_error_span() {
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        let engine = IngressEngine::new(store.clone(), "test-node".into());
+
+        for unmounted in [
+            "/api/obs/v1/causal-problems",
+            "/api/obs/v1/diagnosis/problems",
+            "/api/obs/v1/nonexistent",
+        ] {
+            let req = axum::extract::Request::builder()
+                .method("GET")
+                .uri(unmounted)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = engine.proxy_request(req).await.expect("proxy_request");
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "unmounted path {unmounted} must return 404, not 508"
+            );
+        }
+
+        // Verify zero mu-ingress ERROR spans (and zero spans total) were recorded
+        {
+            let conn = store.lock_conn().expect("lock conn");
+            let error_span_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM v_traces WHERE service_name = 'mu-ingress' AND status_code = 'ERROR'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("count error spans");
+            assert_eq!(error_span_count, 0);
+        }
+
+        // Explicit self-port route under a different ID or overridden route-obs is also guarded
+        engine.set_local_listen_addr("0.0.0.0:19480");
+        engine.add_route(
+            "route-obs",
+            "/api/obs/",
+            "http://localhost:19480/api/",
+            "muobserve",
+            true,
+            false,
+        );
+        let req_self = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/api/obs/v1/causal-problems")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_self = engine.proxy_request(req_self).await.expect("proxy_request");
+        assert_eq!(resp_self.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // Explicit non-self upstream MUST still proxy normally
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let mock_port = listener.local_addr().unwrap().port();
+        let srv_handle = tokio::spawn(async move {
+            use hyper::server::conn::http1;
+            use hyper::service::service_fn;
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .status(hyper::StatusCode::OK)
+                            .body(Full::new(bytes::Bytes::from_static(b"proxied-ok")))
+                            .unwrap(),
+                    )
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            }
+        });
+
+        engine.add_route(
+            "route-obs",
+            "/api/obs/",
+            &format!("http://127.0.0.1:{mock_port}/api/"),
+            "muobserve",
+            true,
+            false,
+        );
+        let req_ext = axum::extract::Request::builder()
+            .method("GET")
+            .uri("/api/obs/v1/external-only")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_ext = engine.proxy_request(req_ext).await.expect("proxy_request");
+        assert_eq!(resp_ext.status(), axum::http::StatusCode::OK);
+        let body = resp_ext.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"proxied-ok");
+        let _ = srv_handle.await;
     }
 }
