@@ -32,6 +32,18 @@ pub const ENV_RETIRED_SERVICES: &str = "MUOBSERVE_RETIRED_SERVICES";
 /// `cutoff_ts = cutoff_ts.max(monitoring_since_ns)` in active monitoring queries.
 pub const ENV_MONITORING_SINCE_UNIX_NANO: &str = "MUOBSERVE_MONITORING_SINCE_UNIX_NANO";
 
+/// Returns `true` when `span_name` identifies a batch CI pipeline or stage execution span
+/// (`ci.pipeline.*` or `ci.stage.*`, case-insensitive after trimming).
+///
+/// Batch CI spans legitimately execute over seconds or minutes and are excluded from
+/// interactive RPC latency percentiles and causal latency regression baselines while still
+/// retaining call counts, error counts, and 100% raw `v_traces` storage rows.
+#[must_use]
+pub fn is_batch_ci_execution_span(span_name: &str) -> bool {
+    let s = span_name.trim().to_ascii_lowercase();
+    s.starts_with("ci.pipeline.") || s.starts_with("ci.stage.")
+}
+
 /// Internal snapshot `parent_repo_key` populated by `mu-ci-controller` containing `retired_repos`.
 pub const CONSOLE_REGISTRY_REPO_KEY: &str = "__ar_console_registry__";
 
@@ -564,5 +576,21 @@ mod tests {
             })
             .expect("unfiltered query");
         assert!(unfiltered.is_empty());
+    }
+
+    #[test]
+    fn test_is_batch_ci_execution_span() {
+        assert!(is_batch_ci_execution_span(
+            "ci.pipeline.run:LMA1980/mu-console"
+        ));
+        assert!(is_batch_ci_execution_span("  CI.Pipeline.Deploy  "));
+        assert!(is_batch_ci_execution_span("ci.stage.dispatch:fmt-check"));
+        assert!(is_batch_ci_execution_span(" CI.STAGE.test-check "));
+
+        // Bare prefixes without trailing dot and interactive RPC spans must not match.
+        assert!(!is_batch_ci_execution_span("ci.pipeline"));
+        assert!(!is_batch_ci_execution_span("ci.stage"));
+        assert!(!is_batch_ci_execution_span("GET /api/obs/v1/problems"));
+        assert!(!is_batch_ci_execution_span(""));
     }
 }

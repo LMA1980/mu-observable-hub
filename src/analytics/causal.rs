@@ -6,7 +6,7 @@
 //! call dependency graph to isolate the originating root-cause service, and correlates
 //! contemporaneous error logs from `v_logs`.
 
-use crate::analytics::exclusions::MonitoringExclusions;
+use crate::analytics::exclusions::{is_batch_ci_execution_span, MonitoringExclusions};
 use crate::error::MuObserveError;
 use crate::server::sanitize::PrivacyRedactor;
 use crate::storage::HotDuckDbStore;
@@ -135,7 +135,7 @@ pub fn compute_causal_problems_with_exclusions(
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT service_name, duration_ns, UPPER(status_code)
+        SELECT service_name, duration_ns, UPPER(status_code), span_name
         FROM v_traces
         WHERE start_time_unix_nano >= ?1
         "#,
@@ -143,6 +143,7 @@ pub fn compute_causal_problems_with_exclusions(
 
     struct ServiceStats {
         durations: Vec<f64>,
+        total_spans: u64,
         error_count: u64,
     }
 
@@ -156,14 +157,19 @@ pub fn compute_causal_problems_with_exclusions(
         }
         let duration_ns: i64 = row.get(1)?;
         let status: String = row.get(2)?;
+        let span_name: String = row.get(3)?;
 
         let entry = service_map.entry(svc).or_insert_with(|| ServiceStats {
             durations: Vec::new(),
+            total_spans: 0,
             error_count: 0,
         });
-        entry
-            .durations
-            .push((duration_ns.max(0) as f64) / 1_000_000.0);
+        entry.total_spans += 1;
+        if !is_batch_ci_execution_span(&span_name) {
+            entry
+                .durations
+                .push((duration_ns.max(0) as f64) / 1_000_000.0);
+        }
         if status == "ERROR" {
             entry.error_count += 1;
         }
@@ -173,32 +179,37 @@ pub fn compute_causal_problems_with_exclusions(
     let mut processed_services = HashSet::new();
 
     for (service_name, stats) in &service_map {
-        if stats.durations.is_empty() {
+        if stats.durations.is_empty() && stats.error_count == 0 {
             continue;
         }
-        let total = stats.durations.len();
+        let total = stats.total_spans.max(stats.durations.len() as u64).max(1);
         let error_rate_pct = (stats.error_count as f64 * 100.0) / (total as f64);
-        let (median, mad) = compute_median_and_mad(&stats.durations);
-        let p95 = compute_percentile(&stats.durations, 0.95);
-        let effective_mad = if mad > 1e-6 {
-            mad
+        let (median, p95, mad_z) = if stats.durations.is_empty() {
+            (0.0, 0.0, 0.0)
         } else {
-            let mean = stats.durations.iter().sum::<f64>() / (stats.durations.len() as f64);
-            let variance = stats
-                .durations
-                .iter()
-                .map(|d| (d - mean).powi(2))
-                .sum::<f64>()
-                / (stats.durations.len() as f64);
-            let std_dev = variance.sqrt();
-            let min_scale = (median.abs() * 0.05).max(1.0);
-            if std_dev > 1e-6 {
-                std_dev.min(min_scale)
+            let (median, mad) = compute_median_and_mad(&stats.durations);
+            let p95 = compute_percentile(&stats.durations, 0.95);
+            let effective_mad = if mad > 1e-6 {
+                mad
             } else {
-                min_scale
-            }
+                let mean = stats.durations.iter().sum::<f64>() / (stats.durations.len() as f64);
+                let variance = stats
+                    .durations
+                    .iter()
+                    .map(|d| (d - mean).powi(2))
+                    .sum::<f64>()
+                    / (stats.durations.len() as f64);
+                let std_dev = variance.sqrt();
+                let min_scale = (median.abs() * 0.05).max(1.0);
+                if std_dev > 1e-6 {
+                    std_dev.min(min_scale)
+                } else {
+                    min_scale
+                }
+            };
+            let mad_z = 0.6745 * (p95 - median) / effective_mad;
+            (median, p95, mad_z)
         };
-        let mad_z = 0.6745 * (p95 - median) / effective_mad;
 
         // Anomaly threshold: MAD Z-score > 3.0 OR error rate > 5.0% OR errors > 0
         let is_anomaly = mad_z > 3.0 || error_rate_pct > 5.0 || stats.error_count > 0;
@@ -238,7 +249,12 @@ pub fn compute_causal_problems_with_exclusions(
                 r#"
                 SELECT trace_id
                 FROM v_traces
-                WHERE service_name = ?1 AND start_time_unix_nano >= ?2
+                WHERE service_name = ?1
+                  AND start_time_unix_nano >= ?2
+                  AND NOT (
+                      STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.pipeline.')
+                      OR STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.stage.')
+                  )
                 ORDER BY duration_ns DESC LIMIT 1
                 "#,
                 params![service_name, cutoff_ts],
