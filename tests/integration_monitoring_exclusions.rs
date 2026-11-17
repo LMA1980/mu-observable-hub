@@ -18,13 +18,14 @@ use http_body_util::BodyExt;
 use mu_auth::{RoleLeases, HEADER_FORWARDED_USER, HEADER_PROXY_SECRET};
 use mu_observable_hub::{
     build_console_api_router, build_console_api_router_with_auth, compute_causal_problems,
-    compute_smartscape_topology, evaluate_deterministic_problems, execute_guarded_sql,
-    CausalProblemsFeedResponse, HotDuckDbStore, IngressEngine, McpServer, MonitoringExclusions,
-    MonitoringExclusionsStatus, MuAuthFolioVerifier, ObsAuthVerifier, SmartscapeTopology,
+    compute_smartscape_topology, evaluate_canary_slo, evaluate_deterministic_problems,
+    execute_guarded_sql, CausalProblemsFeedResponse, HotDuckDbStore, IngressEngine, McpServer,
+    MonitoringExclusions, MonitoringExclusionsStatus, MuAuthFolioVerifier, ObsAuthVerifier,
+    SmartscapeTopology,
 };
 use mu_observable_ipc::{
-    BenchmarkRunEntry, CentralJobRecord, CentralSubmoduleSnapshot, OtelLogEntry, OtelSpanEntry,
-    QuerySubmoduleSnapshotsRequest, TestCaseRunEntry,
+    BenchmarkRunEntry, CanarySloAssertionRequest, CentralJobRecord, CentralSubmoduleSnapshot,
+    OtelLogEntry, OtelMetricEntry, OtelSpanEntry, QuerySubmoduleSnapshotsRequest, TestCaseRunEntry,
 };
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -940,4 +941,344 @@ async fn test_batch_ci_execution_spans_excluded_from_latency_slo_and_causal_aler
         causal_slow[0].root_cause_trace_id.as_deref(),
         Some("trace-rpc-slow")
     );
+}
+
+#[tokio::test]
+async fn test_canary_excludes_ci_job_console_logs_while_preserving_v_logs() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env_guard = EnvRestoreGuard::capture(&[
+        "MUOBSERVE_EXCLUDED_REPOS",
+        "MUOBSERVE_RETIRED_SERVICES",
+        "MUOBSERVE_MONITORING_SINCE_UNIX_NANO",
+    ]);
+    std::env::remove_var("MUOBSERVE_EXCLUDED_REPOS");
+    std::env::remove_var("MUOBSERVE_RETIRED_SERVICES");
+    std::env::remove_var("MUOBSERVE_MONITORING_SINCE_UNIX_NANO");
+
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let now_ts = 1_794_900_100_000_000_000i64;
+
+    store
+        .insert_spans_batch(&[OtelSpanEntry {
+            trace_id: "trace-ci-docs".into(),
+            span_id: "span-ci-docs".into(),
+            parent_span_id: None,
+            service_name: "mu-ci-worker".into(),
+            node_id: "worker-aarch64".into(),
+            span_name: "ci.stage.dispatch:docs-check".into(),
+            span_kind: "SERVER".into(),
+            start_time_unix_nano: now_ts - 30_000_000_000,
+            end_time_unix_nano: now_ts,
+            duration_ns: 30_000_000_000,
+            status_code: "OK".into(),
+            status_message: None,
+            attributes_json: r#"{"domain":"ci"}"#.into(),
+        }])
+        .unwrap();
+
+    // Passing CI test stdout/stderr INFO lines and INFO informational text containing "panic".
+    store
+        .insert_logs_batch(&[
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 2_000_000_000,
+                trace_id: "trace-ci-docs".into(),
+                span_id: "span-ci-docs".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-aarch64".into(),
+                body: "test test_challenge_4_abrupt_abort_and_panic_determinism ... ok".into(),
+                attributes_json: r#"{"line_no":937,"stream":"stderr"}"#.into(),
+                job_id: Some("job-ci-18".into()),
+                stage_id: Some("docs-check".into()),
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 1_500_000_000,
+                trace_id: "trace-ci-docs".into(),
+                span_id: "span-ci-docs".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-aarch64".into(),
+                body: "test concurrency::tests::lock_released_on_panic_and_cancel ... ok".into(),
+                attributes_json: r#"{"line_no":817,"stream":"stdout"}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 1_000_000_000,
+                trace_id: "trace-ci-docs".into(),
+                span_id: "span-ci-docs".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-aarch64".into(),
+                body: "running panic handler verification probe".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ])
+        .unwrap();
+
+    let det_clean = evaluate_deterministic_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert_eq!(
+        det_clean.open_count, 0,
+        "unexpected problems: {det_clean:?}"
+    );
+
+    let slo_clean = evaluate_canary_slo(
+        &store,
+        &CanarySloAssertionRequest {
+            request_id: "ci-console-clean".into(),
+            service_name: "mu-ci-worker".into(),
+            candidate_digest: "sha256:clean".into(),
+            node_id: "worker-aarch64".into(),
+            bake_window_secs: 60,
+            max_error_logs: 0,
+            max_p99_latency_ms: 100.0,
+        },
+        Some(now_ts),
+    )
+    .unwrap();
+    assert!(slo_clean.healthy);
+    assert!(!slo_clean.taint_recommended);
+
+    // Maintainer Decision A1: 100% of CI console log rows remain queryable in v_logs.
+    assert_eq!(store.count_rows("v_logs").unwrap(), 3);
+    let sql_logs = execute_guarded_sql(
+        &store,
+        "SELECT COUNT(*) FROM v_logs WHERE LOWER(body) LIKE '%panic%'",
+        10,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(sql_logs.rows[0][0], json!(3));
+
+    // Real daemon ERROR crash log and FATAL crash log (job_id = None, line_no = 0) MUST surface!
+    store
+        .insert_logs_batch(&[
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 500_000_000,
+                trace_id: "trace-ctrl-panic".into(),
+                span_id: "span-ctrl-panic".into(),
+                severity_number: 17,
+                severity_text: "ERROR".into(),
+                service_name: "mu-ci-controller".into(),
+                node_id: "node-a".into(),
+                body: "daemon task panic in dispatcher".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 250_000_000,
+                trace_id: "trace-mr-fatal".into(),
+                span_id: "span-mr-fatal".into(),
+                severity_number: 21,
+                severity_text: "FATAL".into(),
+                service_name: "model-runner".into(),
+                node_id: "worker-riscv64".into(),
+                body: "unrecoverable runtime fault".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ])
+        .unwrap();
+
+    let det_crash = evaluate_deterministic_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert!(!det_crash
+        .problems
+        .iter()
+        .any(|p| p.problem_id == "PROB-CANARY-mu-ci-worker"));
+    assert!(det_crash
+        .problems
+        .iter()
+        .any(|p| p.problem_id == "PROB-CANARY-mu-ci-controller" && p.category == "canary_taint"));
+    assert!(det_crash
+        .problems
+        .iter()
+        .any(|p| p.problem_id == "PROB-CANARY-model-runner" && p.category == "canary_taint"));
+
+    let slo_crash = evaluate_canary_slo(
+        &store,
+        &CanarySloAssertionRequest {
+            request_id: "ctrl-panic".into(),
+            service_name: "mu-ci-controller".into(),
+            candidate_digest: "sha256:bad".into(),
+            node_id: "node-a".into(),
+            bake_window_secs: 60,
+            max_error_logs: 0,
+            max_p99_latency_ms: 100.0,
+        },
+        Some(now_ts),
+    )
+    .unwrap();
+    assert!(!slo_crash.healthy);
+    assert!(slo_crash.taint_recommended);
+    assert_eq!(store.count_rows("v_logs").unwrap(), 5);
+}
+
+#[tokio::test]
+async fn test_heartbeat_uses_multi_signal_liveness_across_traces_metrics_and_logs() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let _env_guard = EnvRestoreGuard::capture(&[
+        "MUOBSERVE_EXCLUDED_REPOS",
+        "MUOBSERVE_RETIRED_SERVICES",
+        "MUOBSERVE_MONITORING_SINCE_UNIX_NANO",
+    ]);
+    std::env::remove_var("MUOBSERVE_EXCLUDED_REPOS");
+    std::env::remove_var("MUOBSERVE_RETIRED_SERVICES");
+    std::env::remove_var("MUOBSERVE_MONITORING_SINCE_UNIX_NANO");
+
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let now_ts = 1_794_900_100_000_000_000i64;
+
+    // All nodes ran their last trace span well over 300s ago:
+    // - worker-aarch64: last trace 4500s ago, fresh metric 3s ago -> ALIVE
+    // - node-a: last trace 1200s ago, fresh log 5s ago -> ALIVE
+    // - node-stale: last trace 600s ago, last metric 550s ago, last log 500s ago -> STALE (500s)
+    store
+        .insert_spans_batch(&[
+            OtelSpanEntry {
+                trace_id: "tr-aarch64-old".into(),
+                span_id: "sp-aarch64-old".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-aarch64".into(),
+                span_name: "ci.stage.dispatch:fmt-check".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 4_510_000_000_000,
+                end_time_unix_nano: now_ts - 4_500_000_000_000,
+                duration_ns: 10_000_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            },
+            OtelSpanEntry {
+                trace_id: "tr-node-a-old".into(),
+                span_id: "sp-node-a-old".into(),
+                parent_span_id: None,
+                service_name: "mu-ingress".into(),
+                node_id: "node-a".into(),
+                span_name: "GET /healthz".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 1_200_005_000_000,
+                end_time_unix_nano: now_ts - 1_200_000_000_000,
+                duration_ns: 5_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            },
+            OtelSpanEntry {
+                trace_id: "tr-stale-old".into(),
+                span_id: "sp-stale-old".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-worker".into(),
+                node_id: "node-stale".into(),
+                span_name: "ci.stage.dispatch:build-check".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 610_000_000_000,
+                end_time_unix_nano: now_ts - 600_000_000_000,
+                duration_ns: 10_000_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            },
+        ])
+        .unwrap();
+
+    store
+        .insert_metrics_batch(&[
+            OtelMetricEntry {
+                timestamp_unix_nano: now_ts - 3_000_000_000, // 3s ago -> keeps worker-aarch64 healthy & sets anchor_ts
+                service_name: "mu-observable-sentinel".into(),
+                node_id: "worker-aarch64".into(),
+                metric_name: "host.cpu.utilization".into(),
+                metric_unit: "pct".into(),
+                value_f64: 12.0,
+                arch: "aarch64".into(),
+                cpu_cluster: None,
+                vlen_bits: None,
+                memlock_used_bytes: None,
+                memlock_limit_bytes: None,
+                trace_id: None,
+                span_id: None,
+                attributes_json: "{}".into(),
+            },
+            OtelMetricEntry {
+                timestamp_unix_nano: now_ts - 550_000_000_000, // stale 550s ago
+                service_name: "mu-observable-sentinel".into(),
+                node_id: "node-stale".into(),
+                metric_name: "host.cpu.utilization".into(),
+                metric_unit: "pct".into(),
+                value_f64: 4.0,
+                arch: "x86_64".into(),
+                cpu_cluster: None,
+                vlen_bits: None,
+                memlock_used_bytes: None,
+                memlock_limit_bytes: None,
+                trace_id: None,
+                span_id: None,
+                attributes_json: "{}".into(),
+            },
+        ])
+        .unwrap();
+
+    store
+        .insert_logs_batch(&[
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 5_000_000_000, // 5s ago -> keeps node-a healthy
+                trace_id: String::new(),
+                span_id: String::new(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-ingress".into(),
+                node_id: "node-a".into(),
+                body: "keepalive OK".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 500_000_000_000, // stale 500s ago across all 3 views
+                trace_id: String::new(),
+                span_id: String::new(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-ci-worker".into(),
+                node_id: "node-stale".into(),
+                body: "last log before going silent".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ])
+        .unwrap();
+
+    // Check with explicit now_ts and implicit anchor_ts (None -> MAX across traces/metrics/logs)
+    for now_arg in [Some(now_ts), None] {
+        let det = evaluate_deterministic_problems(&store, 7200, now_arg).unwrap();
+        assert!(!det
+            .problems
+            .iter()
+            .any(|p| p.problem_id == "PROB-HEARTBEAT-worker-aarch64"));
+        assert!(!det
+            .problems
+            .iter()
+            .any(|p| p.problem_id == "PROB-HEARTBEAT-node-a"));
+        let stale_card = det
+            .problems
+            .iter()
+            .find(|p| p.problem_id == "PROB-HEARTBEAT-node-stale")
+            .expect(
+                "node-stale must trigger heartbeat staleness when silent >300s across all signals",
+            );
+        assert_eq!(stale_card.category, "heartbeat_staleness");
+    }
+
+    assert_eq!(store.count_rows("v_traces").unwrap(), 3);
+    assert_eq!(store.count_rows("v_metrics").unwrap(), 2);
+    assert_eq!(store.count_rows("v_logs").unwrap(), 2);
 }

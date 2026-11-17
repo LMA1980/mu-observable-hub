@@ -1,6 +1,7 @@
 use duckdb::params;
 use mu_observable_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
 
+use crate::analytics::exclusions::is_batch_ci_execution_span;
 use crate::error::MuObserveError;
 use crate::storage::hot_duckdb::HotDuckDbStore;
 
@@ -58,7 +59,7 @@ pub fn evaluate_canary_slo(
         |r| r.get(0),
     )?;
 
-    // Detect crash/panic telemetry (FATAL severity >= 21 or crash/panic/SIGSEGV/SIGABRT in log body or attributes)
+    // Detect crash/panic telemetry from runtime daemon logs (excluding CI job stdout/stderr lines)
     let crash_count_i64: i64 = conn.query_row(
         r#"
         SELECT COUNT(*)
@@ -66,23 +67,32 @@ pub fn evaluate_canary_slo(
         WHERE service_name = ?1
           AND (?2 IS NULL OR node_id = ?2)
           AND timestamp_unix_nano >= ?3
+          AND COALESCE(job_id, '') = ''
+          AND COALESCE(stage_id, '') = ''
+          AND line_no = 0
+          AND attributes_json NOT LIKE '%"line_no":%'
           AND (
               severity_number >= 21
-              OR UPPER(severity_text) = 'FATAL'
-              OR LOWER(body) LIKE '%panic%'
-              OR LOWER(body) LIKE '%sigsegv%'
-              OR LOWER(body) LIKE '%sigill%'
-              OR LOWER(body) LIKE '%crash%'
+              OR UPPER(severity_text) IN ('FATAL', 'CRITICAL')
+              OR (
+                  (severity_number >= 17 OR UPPER(severity_text) = 'ERROR')
+                  AND (
+                      LOWER(body) LIKE '%panic%'
+                      OR LOWER(body) LIKE '%sigsegv%'
+                      OR LOWER(body) LIKE '%sigill%'
+                      OR LOWER(body) LIKE '%crash%'
+                  )
+              )
           )
         "#,
         params![req.service_name, node_filter, cutoff_ts],
         |r| r.get(0),
     )?;
 
-    // Gather span durations in the bake window to compute p99 latency in milliseconds
+    // Gather interactive span durations in the bake window to compute p99 latency in milliseconds
     let mut span_stmt = conn.prepare(
         r#"
-        SELECT duration_ns, status_code
+        SELECT duration_ns, status_code, span_name
         FROM v_traces
         WHERE service_name = ?1
           AND (?2 IS NULL OR node_id = ?2)
@@ -91,16 +101,22 @@ pub fn evaluate_canary_slo(
         "#,
     )?;
 
-    let span_rows = span_stmt
-        .query_map(params![req.service_name, node_filter, cutoff_ts], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    let span_rows =
+        span_stmt.query_map(params![req.service_name, node_filter, cutoff_ts], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
 
     let mut durations_ms = Vec::new();
     let mut error_spans = 0u32;
     for sr in span_rows {
-        let (dur_ns, status) = sr?;
-        durations_ms.push((dur_ns.max(0) as f64) / 1_000_000.0);
+        let (dur_ns, status, span_name) = sr?;
+        if !is_batch_ci_execution_span(&span_name) {
+            durations_ms.push((dur_ns.max(0) as f64) / 1_000_000.0);
+        }
         if status.eq_ignore_ascii_case("ERROR") {
             error_spans = error_spans.saturating_add(1);
         }
@@ -254,5 +270,93 @@ mod tests {
         assert!(breach_resp.taint_recommended);
         assert_eq!(breach_resp.error_log_count, 1);
         assert!((breach_resp.p99_latency_ms - 500.0).abs() < 1e-6);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_canary_slo_ignores_ci_job_console_logs_and_batch_ci_spans() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let now_ts = 1_794_900_100_000_000_000i64;
+
+        store
+            .insert_spans_batch(&[
+                OtelSpanEntry {
+                    trace_id: "tr-batch".into(),
+                    span_id: "sp-batch".into(),
+                    parent_span_id: None,
+                    service_name: "mu-ci-worker".into(),
+                    node_id: "worker-aarch64".into(),
+                    span_name: "ci.stage.dispatch:docs-check".into(),
+                    span_kind: "INTERNAL".into(),
+                    start_time_unix_nano: now_ts - 30_000_000_000,
+                    end_time_unix_nano: now_ts - 1_000_000_000,
+                    duration_ns: 29_000_000_000, // 29s batch stage must not inflate p99
+                    status_code: "OK".into(),
+                    status_message: None,
+                    attributes_json: "{}".into(),
+                },
+                OtelSpanEntry {
+                    trace_id: "tr-rpc".into(),
+                    span_id: "sp-rpc".into(),
+                    parent_span_id: None,
+                    service_name: "mu-ci-worker".into(),
+                    node_id: "worker-aarch64".into(),
+                    span_name: "GET /healthz".into(),
+                    span_kind: "SERVER".into(),
+                    start_time_unix_nano: now_ts - 15_000_000,
+                    end_time_unix_nano: now_ts,
+                    duration_ns: 15_000_000, // 15 ms
+                    status_code: "OK".into(),
+                    status_message: None,
+                    attributes_json: "{}".into(),
+                },
+            ])
+            .unwrap();
+
+        store
+            .insert_logs_batch(&[
+                OtelLogEntry {
+                    timestamp_unix_nano: now_ts - 500_000_000,
+                    trace_id: "tr-batch".into(),
+                    span_id: "sp-batch".into(),
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    service_name: "mu-ci-worker".into(),
+                    node_id: "worker-aarch64".into(),
+                    body: "test test_challenge_4_abrupt_abort_and_panic_determinism ... ok".into(),
+                    attributes_json: r#"{"line_no":937,"stream":"stderr"}"#.into(),
+                    job_id: Some("job-ci-18".into()),
+                    stage_id: Some("docs-check".into()),
+                },
+                OtelLogEntry {
+                    timestamp_unix_nano: now_ts - 400_000_000,
+                    trace_id: "tr-rpc".into(),
+                    span_id: "sp-rpc".into(),
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    service_name: "mu-ci-worker".into(),
+                    node_id: "worker-aarch64".into(),
+                    body: "test concurrency::tests::lock_released_on_panic_and_cancel ... ok"
+                        .into(),
+                    attributes_json: r#"{"line_no":817,"stream":"stdout"}"#.into(),
+                    job_id: None,
+                    stage_id: None,
+                },
+            ])
+            .unwrap();
+
+        let req = CanarySloAssertionRequest {
+            request_id: "slo-ci-ok".into(),
+            service_name: "mu-ci-worker".into(),
+            candidate_digest: "sha256:ci".into(),
+            node_id: "worker-aarch64".into(),
+            bake_window_secs: 60,
+            max_error_logs: 0,
+            max_p99_latency_ms: 100.0,
+        };
+        let resp = evaluate_canary_slo(&store, &req, Some(now_ts)).unwrap();
+        assert!(resp.healthy, "unexpected SLO breach: {}", resp.reason);
+        assert!(!resp.taint_recommended);
+        assert!((resp.p99_latency_ms - 15.0).abs() < 1e-6);
     }
 }
