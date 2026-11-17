@@ -520,7 +520,14 @@ pub fn evaluate_deterministic_problems_with_exclusions(
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
-            max_span.max(max_log)
+            let max_metric: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(timestamp_unix_nano), 0) FROM v_metrics",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            max_span.max(max_log).max(max_metric)
         }
     };
     let raw_cutoff = if anchor_ts > 0 {
@@ -601,20 +608,29 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }
     }
 
-    // 3. Evaluate Canary Taint / Crash Telemetry from v_logs
+    // 3. Evaluate Canary Taint / Crash Telemetry from runtime v_logs (excluding CI job console output)
     if let Ok(mut crash_stmt) = conn.prepare(
         r#"
         SELECT service_name, trace_id, body, timestamp_unix_nano
         FROM v_logs
         WHERE timestamp_unix_nano >= ?1
+          AND COALESCE(job_id, '') = ''
+          AND COALESCE(stage_id, '') = ''
+          AND line_no = 0
+          AND attributes_json NOT LIKE '%"line_no":%'
           AND (
               severity_number >= 21
               OR UPPER(severity_text) IN ('FATAL', 'CRITICAL')
-              OR LOWER(body) LIKE '%panic%'
-              OR LOWER(body) LIKE '%sigsegv%'
-              OR LOWER(body) LIKE '%sigill%'
-              OR LOWER(body) LIKE '%crash%'
-              OR LOWER(body) LIKE '%taint%'
+              OR (
+                  (severity_number >= 17 OR UPPER(severity_text) = 'ERROR')
+                  AND (
+                      LOWER(body) LIKE '%panic%'
+                      OR LOWER(body) LIKE '%sigsegv%'
+                      OR LOWER(body) LIKE '%sigill%'
+                      OR LOWER(body) LIKE '%crash%'
+                      OR LOWER(body) LIKE '%taint%'
+                  )
+              )
           )
         ORDER BY timestamp_unix_nano DESC
         LIMIT 20
@@ -668,14 +684,28 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }
     }
 
-    // 4. Evaluate Heartbeat Staleness across nodes when anchor_ts > 0
+    // 4. Evaluate Heartbeat Staleness across nodes when anchor_ts > 0 using traces, metrics, and logs
     if anchor_ts > 0 {
         let staleness_threshold_ns: i64 = 300_000_000_000; // 5 minutes
         if let Ok(mut hb_stmt) = conn.prepare(
             r#"
-            SELECT node_id, service_name, MAX(end_time_unix_nano) AS last_seen_ns
-            FROM v_traces
-            WHERE (?1 IS NULL OR end_time_unix_nano >= ?1)
+            SELECT node_id, service_name, MAX(ts_ns) AS last_seen_ns
+            FROM (
+                SELECT node_id, service_name, end_time_unix_nano AS ts_ns
+                FROM v_traces
+                WHERE (?1 IS NULL OR end_time_unix_nano >= ?1)
+                  AND TRIM(node_id) != ''
+                UNION ALL
+                SELECT node_id, service_name, timestamp_unix_nano AS ts_ns
+                FROM v_metrics
+                WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+                  AND TRIM(node_id) != ''
+                UNION ALL
+                SELECT node_id, service_name, timestamp_unix_nano AS ts_ns
+                FROM v_logs
+                WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+                  AND TRIM(node_id) != ''
+            )
             GROUP BY node_id, service_name
             "#,
         ) {
@@ -688,7 +718,7 @@ pub fn evaluate_deterministic_problems_with_exclusions(
                     ))
                 })
             {
-                let mut node_last_seen: BTreeMap<String, i64> = BTreeMap::new();
+                let mut node_last_seen: BTreeMap<String, (String, i64)> = BTreeMap::new();
                 for (raw_node, raw_svc, last_seen_ns) in rows.flatten() {
                     let clean_svc = redactor.redact_str(&raw_svc);
                     if exclusions.is_service_excluded(&raw_svc)
@@ -696,16 +726,24 @@ pub fn evaluate_deterministic_problems_with_exclusions(
                     {
                         continue;
                     }
+                    let clean_node = redactor.redact_host(&raw_node);
+                    if clean_node.trim().is_empty() {
+                        continue;
+                    }
                     node_last_seen
-                        .entry(raw_node)
-                        .and_modify(|ts| *ts = (*ts).max(last_seen_ns))
-                        .or_insert(last_seen_ns);
+                        .entry(clean_node)
+                        .and_modify(|(prev_raw, ts)| {
+                            if last_seen_ns > *ts {
+                                *ts = last_seen_ns;
+                                *prev_raw = raw_node.clone();
+                            }
+                        })
+                        .or_insert((raw_node, last_seen_ns));
                 }
 
-                for (raw_node, last_seen_ns) in node_last_seen {
+                for (clean_node, (raw_node, last_seen_ns)) in node_last_seen {
                     let lag_ns = anchor_ts.saturating_sub(last_seen_ns);
                     if lag_ns > staleness_threshold_ns {
-                        let clean_node = redactor.redact_host(&raw_node);
                         let last_trace: Option<String> = conn
                             .query_row(
                                 "SELECT trace_id FROM v_traces WHERE node_id = ?1 AND (?2 IS NULL OR end_time_unix_nano >= ?2) ORDER BY end_time_unix_nano DESC LIMIT 1",
