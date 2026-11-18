@@ -1492,3 +1492,150 @@ async fn test_ci_regressions_and_user_ci_exit_spans_excluded_from_runtime_proble
         slo.reason
     );
 }
+
+#[tokio::test]
+async fn test_failing_test_surfaces_in_problems_and_clears_immediately_when_fixed() {
+    let _guard = ENV_LOCK.lock().await;
+    let _restore = EnvRestoreGuard::capture(&[
+        "MUOBSERVE_EXCLUDED_REPOS",
+        "MUOBSERVE_RETIRED_SERVICES",
+        "MUOBSERVE_MONITORING_SINCE_UNIX_NANO",
+    ]);
+    std::env::remove_var("MUOBSERVE_EXCLUDED_REPOS");
+    std::env::remove_var("MUOBSERVE_RETIRED_SERVICES");
+    std::env::remove_var("MUOBSERVE_MONITORING_SINCE_UNIX_NANO");
+
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let now_ts = 1_795_000_000_000_000_000i64;
+
+    let mk_run = |offset_secs: i64, job_id: &str, sha: &str, test_name: &str, status: &str| {
+        TestCaseRunEntry {
+            job_id: job_id.into(),
+            repo_key: "lma1980/jero-core".into(),
+            branch_key: "main".into(),
+            commit_sha: sha.into(),
+            crate_name: "jero-core".into(),
+            test_binary: "cargo-test".into(),
+            test_name: test_name.into(),
+            status: status.into(),
+            duration_ms: 5.0,
+            failure_summary: if status == "failed" {
+                Some("assertion failed".into())
+            } else {
+                None
+            },
+            timestamp_unix_nano: now_ts + offset_secs * 1_000_000_000,
+            node_id: "node-a".into(),
+            arch: "x86_64".into(),
+        }
+    };
+
+    // 1. Two tests fail on sha-1 -> GET /api/obs/v1/problems surfaces 2 PROB-TEST-* cards.
+    store
+        .insert_test_runs_batch(&[
+            mk_run(1, "job-1", "sha-1", "tests::test_alpha", "failed"),
+            mk_run(2, "job-1", "sha-1", "tests::test_beta", "failed"),
+        ])
+        .unwrap();
+
+    let router = build_console_api_router(store.clone());
+    let resp1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/problems?window_secs=3600")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    let feed1: CausalProblemsFeedResponse =
+        serde_json::from_slice(&resp1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(feed1.problems.len(), 2);
+    assert!(feed1
+        .problems
+        .iter()
+        .all(|p| p.problem_id.starts_with("PROB-TEST-") && p.severity == "error"));
+
+    // 2. One test is fixed on sha-2 while the second still fails -> drops to 1 card.
+    store
+        .insert_test_runs_batch(&[
+            mk_run(3, "job-2", "sha-2", "tests::test_alpha", "ok"),
+            mk_run(4, "job-2", "sha-2", "tests::test_beta", "failed"),
+        ])
+        .unwrap();
+    let resp2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/problems?window_secs=3600")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let feed2: CausalProblemsFeedResponse =
+        serde_json::from_slice(&resp2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(feed2.problems.len(), 1);
+    assert!(feed2.problems[0].title.contains("tests::test_beta"));
+
+    // 3. Second test passes on sha-3 -> drops immediately to 0 cards.
+    store
+        .insert_test_runs_batch(&[
+            mk_run(5, "job-3", "sha-3", "tests::test_alpha", "ok"),
+            mk_run(6, "job-3", "sha-3", "tests::test_beta", "ok"),
+        ])
+        .unwrap();
+    let resp3 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/problems?window_secs=3600")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let feed3: CausalProblemsFeedResponse =
+        serde_json::from_slice(&resp3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        feed3.problems.is_empty(),
+        "Fixed tests must stop alerting immediately: {:?}",
+        feed3.problems
+    );
+
+    // 4. Verify SSE /api/obs/v1/events classifies RESOLVED broadcasts as `event: problem_resolved`.
+    let sse_resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/events")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut sse_body = sse_resp.into_body();
+    store.broadcast_event(
+        r#"{"problem_id":"PROB-TEST-jero-core-cargo-test-tests::test_beta","status":"RESOLVED","title":"Failing Test jero-core::tests::test_beta (cargo-test)"}"#,
+    );
+    let resolved_frame = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(frame)) = sse_body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                let text = String::from_utf8_lossy(data).into_owned();
+                if text.contains("problem_resolved") {
+                    return text;
+                }
+            }
+        }
+        String::new()
+    })
+    .await
+    .expect("SSE problem_resolved timeout");
+    assert!(resolved_frame.contains("event: problem_resolved"));
+}

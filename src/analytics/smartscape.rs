@@ -7,8 +7,8 @@ use crate::analytics::exclusions::{
     is_batch_ci_execution_span, is_user_ci_failure_span, MonitoringExclusions,
 };
 use crate::analytics::regression::{
-    compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, is_ignored_status,
-    is_pass_status, DEFAULT_MAX_MAD_Z_SCORE,
+    compute_active_failing_tests_with_min_ts, evaluate_benchmark_regressions,
+    DEFAULT_MAX_MAD_Z_SCORE,
 };
 use crate::error::MuObserveError;
 use crate::server::sanitize::PrivacyRedactor;
@@ -886,18 +886,14 @@ pub fn evaluate_deterministic_problems_with_exclusions(
     }
 
     for repo_key in test_repos {
-        if let Ok(flaky_items) = compute_test_flakiness_with_min_ts(
+        if let Ok(failing_items) = compute_active_failing_tests_with_min_ts(
             store,
             &repo_key,
-            None,
             30,
             now_unix_nano,
             exclusions.monitoring_since_unix_nano,
         ) {
-            for item in flaky_items.into_iter().filter(|t| {
-                t.flip_flop_count > 0
-                    || (!is_pass_status(&t.status) && !is_ignored_status(&t.status))
-            }) {
+            for (item, commit_sha) in failing_items {
                 let clean_repo = redactor.redact_str(&repo_key);
                 problems.push(ProblemCard {
                     problem_id: format!(
@@ -905,28 +901,24 @@ pub fn evaluate_deterministic_problems_with_exclusions(
                         item.crate_name, item.test_binary, item.test_name
                     ),
                     title: format!(
-                        "Flaky / Failing Test {}::{} ({})",
+                        "Failing Test {}::{} ({})",
                         item.crate_name, item.test_name, item.test_binary
                     ),
-                    severity: if is_pass_status(&item.status) {
-                        "warning".into()
-                    } else {
-                        "error".into()
-                    },
+                    severity: "error".into(),
                     status: "OPEN".into(),
                     category: "test_flakiness".into(),
                     impacted_entity: clean_repo,
                     slo_metric: format!(
-                        "flakiness_pct={:.1}%, flip_flops={}",
-                        item.flakiness_pct, item.flip_flop_count
+                        "status={}, flakiness_pct={:.1}%, flip_flops={}",
+                        item.status, item.flakiness_pct, item.flip_flop_count
                     ),
                     root_cause_trace_id: None,
-                    artifact_digest: None,
+                    artifact_digest: Some(commit_sha),
                     detected_at_ms,
                     summary: redactor.redact_str(
                         item.failure_summary
                             .as_deref()
-                            .unwrap_or("Test exhibited pass/fail flip-flops in 30-day window"),
+                            .unwrap_or("Latest test execution failed"),
                     ),
                     maintenance_suppressed: None,
                     maintenance_subsystem: None,
