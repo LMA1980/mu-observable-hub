@@ -44,6 +44,52 @@ pub fn is_batch_ci_execution_span(span_name: &str) -> bool {
     s.starts_with("ci.pipeline.") || s.starts_with("ci.stage.")
 }
 
+/// Returns `true` when `category` identifies a CI inner-step test or benchmark regression
+/// finding (`test_flakiness` or `benchmark_regression`, case-insensitive) rather than a
+/// runtime service or host SLO alert.
+#[must_use]
+pub fn is_ci_regression_problem_category(category: &str) -> bool {
+    matches!(
+        category.trim().to_ascii_lowercase().as_str(),
+        "test_flakiness" | "benchmark_regression"
+    )
+}
+
+/// Returns `true` when an `ERROR`-tagged batch CI span reflects a non-infrastructure CI job or
+/// stage exit (e.g., user test/lint failure or cancellation) rather than a runtime daemon,
+/// worker, sandbox, timeout, or signal fault.
+#[must_use]
+pub fn is_user_ci_failure_span(span_name: &str, attributes_json: &str) -> bool {
+    if !is_batch_ci_execution_span(span_name) {
+        return false;
+    }
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(attributes_json) else {
+        return false;
+    };
+    if map.get("infra_error").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+    if map.get("infra_error").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    if matches!(
+        map.get("outcome").and_then(Value::as_str),
+        Some("user_failure" | "cancelled" | "succeeded")
+    ) {
+        return true;
+    }
+    if let Some(code) = map.get("exit_code").and_then(Value::as_i64) {
+        if (1..=123).contains(&code) || code == 125 {
+            return true;
+        }
+    }
+    span_name
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("ci.pipeline.")
+        && map.contains_key("job_id")
+}
+
 /// Internal snapshot `parent_repo_key` populated by `mu-ci-controller` containing `retired_repos`.
 pub const CONSOLE_REGISTRY_REPO_KEY: &str = "__ar_console_registry__";
 
@@ -592,5 +638,42 @@ mod tests {
         assert!(!is_batch_ci_execution_span("ci.stage"));
         assert!(!is_batch_ci_execution_span("GET /api/obs/v1/problems"));
         assert!(!is_batch_ci_execution_span(""));
+    }
+
+    #[test]
+    fn test_ci_regression_problem_category_and_user_ci_failure_span() {
+        assert!(is_ci_regression_problem_category("test_flakiness"));
+        assert!(is_ci_regression_problem_category(" BENCHMARK_REGRESSION "));
+        assert!(!is_ci_regression_problem_category("error_rate_breach"));
+        assert!(!is_ci_regression_problem_category("latency_p95_breach"));
+
+        // Non-batch spans never match, even with exit_code or infra_error=false.
+        assert!(!is_user_ci_failure_span(
+            "GET /api/jobs",
+            r#"{"infra_error":false,"exit_code":1}"#
+        ));
+        // Explicit infra_error=true stays visible as a runtime fault.
+        assert!(!is_user_ci_failure_span(
+            "ci.stage.test-check",
+            r#"{"infra_error":true,"exit_code":127}"#
+        ));
+        // Unannotated fixture spans (e.g., {"domain":"ci"}) remain runtime faults.
+        assert!(!is_user_ci_failure_span(
+            "ci.stage.dispatch:test-check",
+            r#"{"domain":"ci"}"#
+        ));
+        // User test/lint failures and pre-#227 controller pipeline spans are classified as user CI exits.
+        assert!(is_user_ci_failure_span(
+            "ci.stage.test-check",
+            r#"{"infra_error":false,"outcome":"user_failure","exit_code":101}"#
+        ));
+        assert!(is_user_ci_failure_span(
+            "ci.stage.dispatch:clippy-check",
+            r#"{"job_id":"j1","stage_id":"clippy-check","exit_code":1}"#
+        ));
+        assert!(is_user_ci_failure_span(
+            "ci.pipeline.run:LMA1980/jero-core",
+            r#"{"job_id":"j1","repo":"LMA1980/jero-core"}"#
+        ));
     }
 }

@@ -1282,3 +1282,213 @@ async fn test_heartbeat_uses_multi_signal_liveness_across_traces_metrics_and_log
     assert_eq!(store.count_rows("v_metrics").unwrap(), 2);
     assert_eq!(store.count_rows("v_logs").unwrap(), 2);
 }
+
+#[tokio::test]
+async fn test_ci_regressions_and_user_ci_exit_spans_excluded_from_runtime_problems_feed() {
+    let _guard = ENV_LOCK.lock().await;
+    let _restore = EnvRestoreGuard::capture(&[
+        "MUOBSERVE_EXCLUDED_REPOS",
+        "MUOBSERVE_RETIRED_SERVICES",
+        "MUOBSERVE_MONITORING_SINCE_UNIX_NANO",
+    ]);
+    std::env::remove_var("MUOBSERVE_EXCLUDED_REPOS");
+    std::env::remove_var("MUOBSERVE_RETIRED_SERVICES");
+    std::env::remove_var("MUOBSERVE_MONITORING_SINCE_UNIX_NANO");
+
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let now_ts = 1_795_000_000_000_000_000i64;
+
+    // 1. Seed a failing/flaky test run and a benchmark regression (CI inner steps, NOT runtime SLOs)
+    store
+        .insert_test_runs_batch(&[
+            TestCaseRunEntry {
+                job_id: "job-ci-1".into(),
+                repo_key: "lma1980/jero-core".into(),
+                branch_key: "main".into(),
+                commit_sha: "sha-ci-1".into(),
+                crate_name: "jero-core".into(),
+                test_binary: "cargo-test".into(),
+                test_name: "test_ci_step_fail".into(),
+                status: "failed".into(),
+                duration_ms: 4.0,
+                failure_summary: Some("assertion failed in cargo test".into()),
+                timestamp_unix_nano: now_ts - 2_000_000_000,
+                node_id: "node-a".into(),
+                arch: "x86_64".into(),
+            },
+            TestCaseRunEntry {
+                job_id: "job-ci-2".into(),
+                repo_key: "lma1980/jero-core".into(),
+                branch_key: "main".into(),
+                commit_sha: "sha-ci-2".into(),
+                crate_name: "jero-core".into(),
+                test_binary: "cargo-test".into(),
+                test_name: "test_ci_step_fail".into(),
+                status: "ok".into(),
+                duration_ms: 4.0,
+                failure_summary: None,
+                timestamp_unix_nano: now_ts - 1_000_000_000,
+                node_id: "node-a".into(),
+                arch: "x86_64".into(),
+            },
+        ])
+        .unwrap();
+    seed_bench_regression(&store, "lma1980/jero-core", "jero-core", now_ts);
+
+    // 2. Seed non-infra CI exit spans (with ERROR status) AND logical node_id="controller" stale span
+    store
+        .insert_spans_batch(&[
+            OtelSpanEntry {
+                trace_id: "trace-user-ci-stage".into(),
+                span_id: "span-user-ci-stage".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-worker".into(),
+                node_id: "node-a".into(),
+                span_name: "ci.stage.test-check".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: now_ts - 10_000_000_000,
+                end_time_unix_nano: now_ts - 5_000_000_000,
+                duration_ns: 5_000_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("cargo test exited with code 101".into()),
+                attributes_json:
+                    r#"{"job_id":"job-ci-1","stage_id":"test-check","exit_code":101,"infra_error":false,"outcome":"user_failure"}"#
+                        .into(),
+            },
+            OtelSpanEntry {
+                trace_id: "trace-user-ci-pipeline".into(),
+                span_id: "span-user-ci-pipeline".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "controller".into(),
+                span_name: "ci.pipeline.run:LMA1980/jero-core".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 600_000_000_000,
+                end_time_unix_nano: now_ts - 590_000_000_000,
+                duration_ns: 10_000_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("CI stage test-check failed".into()),
+                attributes_json: r#"{"job_id":"job-ci-1","repo":"LMA1980/jero-core"}"#.into(),
+            },
+            OtelSpanEntry {
+                trace_id: "trace-healthy-host".into(),
+                span_id: "span-healthy-host".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "node-a".into(),
+                span_name: "GET /api/jobs".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: now_ts - 5_000_000,
+                end_time_unix_nano: now_ts,
+                duration_ns: 5_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            },
+        ])
+        .unwrap();
+
+    // Verify /api/obs/v1/problems has ZERO runtime problems (no PROB-TEST-*, PROB-BENCH-*,
+    // PROB-CAUSAL-*, PROB-ERRORS-*, or PROB-HEARTBEAT-controller).
+    let router = build_console_api_router(store.clone());
+    let prob_resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/problems?window_secs=3600")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(prob_resp.status(), StatusCode::OK);
+    let prob_feed: CausalProblemsFeedResponse =
+        serde_json::from_slice(&prob_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        prob_feed.problems.is_empty(),
+        "CI inner-step tests/benchmarks and user CI failures must not leak into runtime /api/obs/v1/problems: {:?}",
+        prob_feed.problems
+    );
+
+    // Verify MCP analytics / regression gate still accurately sees the flaky test & benchmark regression.
+    let mcp = McpServer::new(store.clone());
+    let flk = mcp
+        .call_tool(
+            "get_test_flakiness",
+            &json!({ "repo_key": "lma1980/jero-core" }),
+        )
+        .unwrap();
+    let flk_tests = flk["tests"].as_array().expect("tests array");
+    assert!(!flk_tests.is_empty());
+    let bench = mcp
+        .call_tool(
+            "check_benchmark_regressions",
+            &json!({ "repo_key": "lma1980/jero-core", "candidate_commit": "cand-sha-jero-core" }),
+        )
+        .unwrap();
+    assert_eq!(bench["report"]["verdict"], "Fail");
+
+    // Verify genuine infra_error=true batch CI span DOES still surface a runtime problem!
+    store
+        .insert_spans_batch(&[OtelSpanEntry {
+            trace_id: "trace-infra-ci-err".into(),
+            span_id: "span-infra-ci-err".into(),
+            parent_span_id: None,
+            service_name: "mu-ci-worker".into(),
+            node_id: "node-a".into(),
+            span_name: "ci.stage.test-check".into(),
+            span_kind: "INTERNAL".into(),
+            start_time_unix_nano: now_ts - 2_000_000_000,
+            end_time_unix_nano: now_ts,
+            duration_ns: 2_000_000_000,
+            status_code: "ERROR".into(),
+            status_message: Some("sandbox exec failure".into()),
+            attributes_json:
+                r#"{"job_id":"job-ci-9","stage_id":"test-check","exit_code":127,"infra_error":true,"outcome":"infra_failure"}"#
+                    .into(),
+        }])
+        .unwrap();
+    let router2 = build_console_api_router(store.clone());
+    let prob_resp2 = router2
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/obs/v1/problems?window_secs=3600")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let prob_feed2: CausalProblemsFeedResponse =
+        serde_json::from_slice(&prob_resp2.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert!(
+        prob_feed2
+            .problems
+            .iter()
+            .any(|p| p.impacted_entity == "mu-ci-worker"),
+        "genuine infra_error=true worker span must still surface runtime problem: {:?}",
+        prob_feed2.problems
+    );
+
+    // Verify canary SLO evaluation ignores user CI exit spans as well.
+    let slo = evaluate_canary_slo(
+        &store,
+        &CanarySloAssertionRequest {
+            request_id: "req-slo".into(),
+            service_name: "mu-ci-controller".into(),
+            candidate_digest: "sha256:ctrl".into(),
+            node_id: String::new(),
+            bake_window_secs: 3600,
+            max_error_logs: 0,
+            max_p99_latency_ms: 100.0,
+        },
+        Some(now_ts),
+    )
+    .unwrap();
+    assert!(
+        slo.healthy,
+        "controller canary SLO breached by user CI span: {}",
+        slo.reason
+    );
+}

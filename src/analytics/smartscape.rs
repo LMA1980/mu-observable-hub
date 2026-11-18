@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use duckdb::params;
 use serde::{Deserialize, Serialize};
 
-use crate::analytics::exclusions::{is_batch_ci_execution_span, MonitoringExclusions};
+use crate::analytics::exclusions::{
+    is_batch_ci_execution_span, is_user_ci_failure_span, MonitoringExclusions,
+};
 use crate::analytics::regression::{
     compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, is_ignored_status,
     is_pass_status, DEFAULT_MAX_MAD_Z_SCORE,
@@ -226,7 +228,8 @@ pub fn compute_smartscape_topology_with_exclusions(
     let mut stmt = conn.prepare(
         r#"
         SELECT
-            trace_id, span_id, parent_span_id, service_name, node_id, duration_ns, status_code, span_name
+            trace_id, span_id, parent_span_id, service_name, node_id, duration_ns, status_code, span_name,
+            COALESCE(attributes_json, '')
         FROM v_traces
         WHERE end_time_unix_nano >= ?1
         ORDER BY start_time_unix_nano ASC
@@ -239,6 +242,7 @@ pub fn compute_smartscape_topology_with_exclusions(
         let raw_svc: String = r.get(3)?;
         let raw_node: String = r.get(4)?;
         let span_name: String = r.get(7)?;
+        let attrs_json: String = r.get(8)?;
         let clean_svc = redactor.redact_str(&raw_svc);
         Ok((
             raw_svc,
@@ -249,7 +253,8 @@ pub fn compute_smartscape_topology_with_exclusions(
                 service_name: clean_svc,
                 node_id: redactor.redact_host(&raw_node),
                 duration_ms: (dur_ns.max(0) as f64) / 1_000_000.0,
-                is_error: status.eq_ignore_ascii_case("ERROR"),
+                is_error: status.eq_ignore_ascii_case("ERROR")
+                    && !is_user_ci_failure_span(&span_name, &attrs_json),
                 is_batch_ci: is_batch_ci_execution_span(&span_name),
             },
         ))
@@ -728,7 +733,8 @@ pub fn evaluate_deterministic_problems_with_exclusions(
                         continue;
                     }
                     let clean_node = redactor.redact_host(&raw_node);
-                    if clean_node.trim().is_empty() {
+                    if clean_node.trim().is_empty() || clean_node.eq_ignore_ascii_case("controller")
+                    {
                         continue;
                     }
                     node_last_seen
@@ -971,20 +977,28 @@ fn find_error_trace_for_service(
     sanitized_service: &str,
     cutoff_ts: i64,
 ) -> Option<String> {
-    conn.query_row(
-        r#"
-        SELECT trace_id
-        FROM v_traces
-        WHERE service_name = ?1
-          AND end_time_unix_nano >= ?2
-          AND UPPER(status_code) = 'ERROR'
-        ORDER BY end_time_unix_nano DESC
-        LIMIT 1
-        "#,
-        params![sanitized_service, cutoff_ts],
-        |r| r.get(0),
-    )
-    .ok()
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT trace_id, span_name, COALESCE(attributes_json, '')
+            FROM v_traces
+            WHERE service_name = ?1
+              AND end_time_unix_nano >= ?2
+              AND UPPER(status_code) = 'ERROR'
+            ORDER BY end_time_unix_nano DESC
+            "#,
+        )
+        .ok()?;
+    let mut rows = stmt.query(params![sanitized_service, cutoff_ts]).ok()?;
+    while let Ok(Some(r)) = rows.next() {
+        let tid: String = r.get(0).ok()?;
+        let sn: String = r.get(1).unwrap_or_default();
+        let attrs: String = r.get(2).unwrap_or_default();
+        if !is_user_ci_failure_span(&sn, &attrs) {
+            return Some(tid);
+        }
+    }
+    None
 }
 
 fn classify_health(error_rate_pct: f64, p95_latency_ms: f64) -> String {
