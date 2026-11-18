@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,9 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::analytics::causal::compute_causal_problems_with_exclusions;
-use crate::analytics::exclusions::{
-    is_ci_regression_problem_category, MonitoringExclusions, MonitoringExclusionsUpdateRequest,
-};
+use crate::analytics::exclusions::{MonitoringExclusions, MonitoringExclusionsUpdateRequest};
 use crate::analytics::purepath::{
     compute_purepath_waterfall, list_trace_summaries, TraceListFilter, TraceListQuery,
 };
@@ -550,16 +548,23 @@ async fn collect_causal_problem_cards(
     let mut all_problems = causal_problems;
     if let Some(feed) = deterministic_feed {
         for dp in feed.problems {
-            if is_ci_regression_problem_category(&dp.category)
-                || dp.problem_id.starts_with("PROB-TEST-")
+            if dp.category.eq_ignore_ascii_case("benchmark_regression")
                 || dp.problem_id.starts_with("PROB-BENCH-")
+                || (dp.problem_id.starts_with("PROB-TEST-")
+                    && dp.severity.eq_ignore_ascii_case("warning"))
             {
                 continue;
             }
-            if !all_problems
-                .iter()
-                .any(|cp| cp.impacted_entity == dp.impacted_entity)
-            {
+            let is_test_problem = dp.problem_id.starts_with("PROB-TEST-")
+                || dp.category.eq_ignore_ascii_case("test_flakiness");
+            let already_present = if is_test_problem {
+                all_problems.iter().any(|cp| cp.problem_id == dp.problem_id)
+            } else {
+                all_problems
+                    .iter()
+                    .any(|cp| cp.impacted_entity == dp.impacted_entity)
+            };
+            if !already_present {
                 all_problems.push(crate::analytics::causal::CausalProblemCard {
                     problem_id: dp.problem_id,
                     title: dp.title,
@@ -655,6 +660,46 @@ async fn handle_get_problems(
     no_store_json(StatusCode::OK, &resp)
 }
 
+struct ObsEventsStreamState {
+    store: HotDuckDbStore,
+    subsystems: Arc<SubsystemStatusRegistry>,
+    rx: tokio::sync::broadcast::Receiver<String>,
+    ticker: tokio::time::Interval,
+    pending_events: VecDeque<(&'static str, String)>,
+    known_problems: BTreeMap<String, crate::analytics::causal::CausalProblemCard>,
+}
+
+fn parse_broadcast_problem_event(
+    msg: &str,
+) -> (
+    bool,
+    Option<String>,
+    Option<crate::analytics::causal::CausalProblemCard>,
+) {
+    let val = serde_json::from_str::<Value>(msg).ok();
+    let pid = val
+        .as_ref()
+        .and_then(|v| v.get("problem_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let resolved = val
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| {
+            matches!(
+                s.trim().to_ascii_uppercase().as_str(),
+                "RESOLVED" | "CLOSED"
+            )
+        });
+    let card = if resolved {
+        None
+    } else {
+        serde_json::from_str::<crate::analytics::causal::CausalProblemCard>(msg).ok()
+    };
+    (resolved, pid, card)
+}
+
 async fn handle_get_problem_events_sse(
     State(store): State<HotDuckDbStore>,
     State(subsystems): State<Arc<SubsystemStatusRegistry>>,
@@ -683,7 +728,8 @@ async fn handle_get_problem_events_sse(
         || ctx.has_policy(ObsPermission::PlatformMaintenanceRead.as_str());
     let redact_status_summary = !ctx.can_read_full_observability();
 
-    let mut initial_events = VecDeque::new();
+    let mut pending_events = VecDeque::new();
+    let mut known_problems = BTreeMap::new();
     if can_problems {
         let initial_problems =
             collect_causal_problem_cards(&store, &subsystems, DEFAULT_SMARTSCAPE_WINDOW_SECS)
@@ -691,10 +737,11 @@ async fn handle_get_problem_events_sse(
                 .map(|o| o.active_problems)
                 .unwrap_or_default();
 
-        for card in &initial_problems {
-            if let Ok(json_line) = serde_json::to_string(card) {
-                initial_events.push_back(json_line);
+        for card in initial_problems {
+            if let Ok(json_line) = serde_json::to_string(&card) {
+                pending_events.push_back(("problem_opened", json_line));
             }
+            known_problems.insert(card.problem_id.clone(), card);
         }
     }
 
@@ -702,81 +749,132 @@ async fn handle_get_problem_events_sse(
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     ticker.tick().await;
 
-    let stream = futures_util::stream::unfold(
-        (rx, ticker, initial_events),
-        move |(mut rx, mut ticker, mut initial)| async move {
-            if let Some(card_json) = initial.pop_front() {
-                let ev = Event::default().event("problem_opened").data(card_json);
-                return Some((
-                    Ok::<Event, std::convert::Infallible>(ev),
-                    (rx, ticker, initial),
-                ));
-            }
+    let stream_state = ObsEventsStreamState {
+        store,
+        subsystems,
+        rx,
+        ticker,
+        pending_events,
+        known_problems,
+    };
 
-            loop {
-                tokio::select! {
-                    recv_res = rx.recv() => {
-                        match recv_res {
-                            Ok(msg) => {
-                                if msg.contains("\"log_entry\"") {
-                                    if !can_logs {
-                                        continue;
-                                    }
-                                    let ev = Event::default().event("log_entry").data(msg);
-                                    return Some((Ok(ev), (rx, ticker, initial)));
-                                } else if msg.contains("\"subsystem_status_changed\"") {
-                                    if !can_status {
-                                        continue;
-                                    }
-                                    let payload = if redact_status_summary {
-                                        let Ok(mut ev_dto) = serde_json::from_str::<SubsystemStatusChangedEvent>(&msg) else {
-                                            continue;
-                                        };
-                                        ev_dto.summary = ev_dto.state.anonymous_generic_summary().to_string();
-                                        let Ok(redacted_json) = serde_json::to_string(&ev_dto) else {
-                                            continue;
-                                        };
-                                        redacted_json
-                                    } else {
-                                        msg
-                                    };
-                                    let ev = Event::default().event("subsystem_status_changed").data(payload);
-                                    return Some((Ok(ev), (rx, ticker, initial)));
-                                } else if msg.contains("\"problem_id\"") {
-                                    if !can_problems {
-                                        continue;
-                                    }
-                                    let ev = Event::default().event("problem_opened").data(msg);
-                                    return Some((Ok(ev), (rx, ticker, initial)));
-                                } else if msg.contains("\"ingress\"") {
-                                    if !can_ingress {
-                                        continue;
-                                    }
-                                    let ev = Event::default().event("ingress_changed").data(msg);
-                                    return Some((Ok(ev), (rx, ticker, initial)));
-                                } else {
-                                    if !can_problems {
-                                        continue;
-                                    }
-                                    let ev = Event::default().event("message").data(msg);
-                                    return Some((Ok(ev), (rx, ticker, initial)));
+    let stream = futures_util::stream::unfold(stream_state, move |mut state| async move {
+        if let Some((ev_name, payload)) = state.pending_events.pop_front() {
+            let ev = Event::default().event(ev_name).data(payload);
+            return Some((Ok::<Event, std::convert::Infallible>(ev), state));
+        }
+
+        loop {
+            tokio::select! {
+                recv_res = state.rx.recv() => {
+                    match recv_res {
+                        Ok(msg) => {
+                            if msg.contains("\"log_entry\"") {
+                                if !can_logs {
+                                    continue;
                                 }
+                                let ev = Event::default().event("log_entry").data(msg);
+                                return Some((Ok(ev), state));
+                            } else if msg.contains("\"subsystem_status_changed\"") {
+                                if !can_status {
+                                    continue;
+                                }
+                                let payload = if redact_status_summary {
+                                    let Ok(mut ev_dto) = serde_json::from_str::<SubsystemStatusChangedEvent>(&msg) else {
+                                        continue;
+                                    };
+                                    ev_dto.summary = ev_dto.state.anonymous_generic_summary().to_string();
+                                    let Ok(redacted_json) = serde_json::to_string(&ev_dto) else {
+                                        continue;
+                                    };
+                                    redacted_json
+                                } else {
+                                    msg
+                                };
+                                let ev = Event::default().event("subsystem_status_changed").data(payload);
+                                return Some((Ok(ev), state));
+                            } else if msg.contains("\"problem_id\"") {
+                                if !can_problems {
+                                    continue;
+                                }
+                                let (resolved, pid, card_opt) = parse_broadcast_problem_event(&msg);
+                                let ev_name = if resolved {
+                                    if let Some(id) = pid {
+                                        state.known_problems.remove(&id);
+                                    }
+                                    "problem_resolved"
+                                } else {
+                                    if let Some(card) = card_opt {
+                                        state.known_problems.insert(card.problem_id.clone(), card);
+                                    }
+                                    "problem_opened"
+                                };
+                                let ev = Event::default().event(ev_name).data(msg);
+                                return Some((Ok(ev), state));
+                            } else if msg.contains("\"ingress\"") {
+                                if !can_ingress {
+                                    continue;
+                                }
+                                let ev = Event::default().event("ingress_changed").data(msg);
+                                return Some((Ok(ev), state));
+                            } else {
+                                if !can_problems {
+                                    continue;
+                                }
+                                let ev = Event::default().event("message").data(msg);
+                                return Some((Ok(ev), state));
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
-                                return Some((Ok(ev), (rx, ticker, initial)));
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                         }
-                    }
-                    _ = ticker.tick() => {
-                        let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
-                        return Some((Ok(ev), (rx, ticker, initial)));
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
+                            return Some((Ok(ev), state));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
                     }
                 }
+                _ = state.ticker.tick() => {
+                    if can_problems {
+                        if let Ok(outcome) = collect_causal_problem_cards(
+                            &state.store,
+                            &state.subsystems,
+                            DEFAULT_SMARTSCAPE_WINDOW_SECS,
+                        )
+                        .await
+                        {
+                            let current: BTreeMap<String, crate::analytics::causal::CausalProblemCard> = outcome
+                                .active_problems
+                                .into_iter()
+                                .map(|c| (c.problem_id.clone(), c))
+                                .collect();
+                            for (pid, old_card) in &state.known_problems {
+                                if !current.contains_key(pid) {
+                                    let mut resolved = old_card.clone();
+                                    resolved.status = "RESOLVED".into();
+                                    if let Ok(json_line) = serde_json::to_string(&resolved) {
+                                        state.pending_events.push_back(("problem_resolved", json_line));
+                                    }
+                                }
+                            }
+                            for (pid, card) in &current {
+                                if !state.known_problems.contains_key(pid) {
+                                    if let Ok(json_line) = serde_json::to_string(card) {
+                                        state.pending_events.push_back(("problem_opened", json_line));
+                                    }
+                                }
+                            }
+                            state.known_problems = current;
+                        }
+                    }
+                    if let Some((ev_name, payload)) = state.pending_events.pop_front() {
+                        let ev = Event::default().event(ev_name).data(payload);
+                        return Some((Ok(ev), state));
+                    }
+                    let ev = Event::default().event("heartbeat").data(r#"{"type":"heartbeat"}"#);
+                    return Some((Ok(ev), state));
+                }
             }
-        },
-    );
+        }
+    });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))

@@ -20,7 +20,8 @@ pub use ingress::{
 pub const DEFAULT_HOT_RETENTION_DAYS: u32 = 7;
 
 pub use analytics::{
-    compute_causal_problems, compute_causal_problems_with_exclusions, compute_purepath_waterfall,
+    compute_active_failing_tests_with_min_ts, compute_causal_problems,
+    compute_causal_problems_with_exclusions, compute_purepath_waterfall,
     compute_smartscape_topology, compute_smartscape_topology_with_exclusions,
     compute_test_flakiness, compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions,
     evaluate_canary_slo, evaluate_deterministic_problems,

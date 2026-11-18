@@ -205,12 +205,53 @@ pub fn compute_test_flakiness_with_min_ts(
         now_unix_nano,
         min_timestamp_unix_nano,
     )?;
-    Ok(computed.into_iter().map(|c| c.item).collect())
+    Ok(computed.items.into_iter().map(|c| c.item).collect())
+}
+
+/// Returns test cases whose chronological latest observation within `window_days` (bounded by
+/// `min_timestamp_unix_nano`) is actively failing (neither passing nor ignored) and belongs to
+/// the latest `commit_sha` observed for `(crate_name, test_binary)`, paired with that commit.
+pub fn compute_active_failing_tests_with_min_ts(
+    store: &HotDuckDbStore,
+    repo_key: &str,
+    window_days: u32,
+    now_unix_nano: Option<i64>,
+    min_timestamp_unix_nano: Option<i64>,
+) -> Result<Vec<(TestRegressionItem, String)>, MuObserveError> {
+    let computed = compute_test_flakiness_internal(
+        store,
+        repo_key,
+        None,
+        window_days,
+        now_unix_nano,
+        min_timestamp_unix_nano,
+    )?;
+    Ok(computed
+        .items
+        .into_iter()
+        .filter(|c| {
+            !is_pass_status(&c.item.status)
+                && !is_ignored_status(&c.item.status)
+                && computed
+                    .latest_binary_commit
+                    .get(&(c.item.crate_name.clone(), c.item.test_binary.clone()))
+                    == Some(&c.latest_commit_sha)
+        })
+        .map(|c| (c.item, c.latest_commit_sha))
+        .collect())
 }
 
 struct ComputedTestFlakiness {
     item: TestRegressionItem,
     ran_on_candidate: bool,
+    latest_commit_sha: String,
+    candidate_flip_flops: u32,
+    failure_episodes: u32,
+}
+
+struct TestFlakinessComputation {
+    items: Vec<ComputedTestFlakiness>,
+    latest_binary_commit: BTreeMap<(String, String), String>,
 }
 
 fn compute_test_flakiness_internal(
@@ -220,7 +261,7 @@ fn compute_test_flakiness_internal(
     window_days: u32,
     now_unix_nano: Option<i64>,
     min_timestamp_unix_nano: Option<i64>,
-) -> Result<Vec<ComputedTestFlakiness>, MuObserveError> {
+) -> Result<TestFlakinessComputation, MuObserveError> {
     let conn = store.lock_conn()?;
 
     let max_ts: i64 = match now_unix_nano {
@@ -277,8 +318,13 @@ fn compute_test_flakiness_internal(
     // Partition by `(crate_name, test_binary, test_name)` so distinct runners such as
     // `cargo-test` and `cargo-miri` never cross-contaminate flakiness or mask runner failures.
     let mut grouped: BTreeMap<(String, String, String), Vec<TestRunObs>> = BTreeMap::new();
+    let mut latest_binary_commit: BTreeMap<(String, String), String> = BTreeMap::new();
     for r in rows {
         let obs = r?;
+        latest_binary_commit.insert(
+            (obs.crate_name.clone(), obs.test_binary.clone()),
+            obs.commit_sha.clone(),
+        );
         grouped
             .entry((
                 obs.crate_name.clone(),
@@ -295,8 +341,11 @@ fn compute_test_flakiness_internal(
             continue;
         }
         let mut flip_flops = 0u32;
+        let mut candidate_flip_flops = 0u32;
+        let mut failure_episodes = 0u32;
         let mut executed_count = 0usize;
         let mut prev_passed: Option<bool> = None;
+        let mut prev_exec_commit: Option<&str> = None;
         let mut latest_executed_for_candidate: Option<&TestRunObs> = None;
         let mut latest_any_for_candidate: Option<&TestRunObs> = None;
         let mut latest_executed: Option<&TestRunObs> = None;
@@ -307,15 +356,26 @@ fn compute_test_flakiness_internal(
             if !ignored {
                 executed_count = executed_count.saturating_add(1);
                 let passed = is_pass_status(&item.status);
-                if !passed && item.failure_summary.is_some() {
-                    latest_failure_summary.clone_from(&item.failure_summary);
+                if !passed {
+                    if prev_passed != Some(false) {
+                        failure_episodes = failure_episodes.saturating_add(1);
+                    }
+                    if item.failure_summary.is_some() {
+                        latest_failure_summary.clone_from(&item.failure_summary);
+                    }
                 }
                 if let Some(prev) = prev_passed {
                     if prev != passed {
                         flip_flops = flip_flops.saturating_add(1);
+                        if candidate_commit.is_some_and(|cand| cand == item.commit_sha)
+                            && prev_exec_commit == Some(item.commit_sha.as_str())
+                        {
+                            candidate_flip_flops = candidate_flip_flops.saturating_add(1);
+                        }
                     }
                 }
                 prev_passed = Some(passed);
+                prev_exec_commit = Some(item.commit_sha.as_str());
                 latest_executed = Some(item);
             }
             if let Some(cand) = candidate_commit {
@@ -336,10 +396,15 @@ fn compute_test_flakiness_internal(
         };
 
         let ran_on_candidate = latest_any_for_candidate.is_some();
-        let representative = latest_executed_for_candidate
-            .or(latest_any_for_candidate)
-            .or(latest_executed)
-            .unwrap_or_else(|| history.last().unwrap());
+        let representative = if candidate_commit.is_some() {
+            latest_executed_for_candidate
+                .or(latest_any_for_candidate)
+                .or(latest_executed)
+                .unwrap_or_else(|| history.last().unwrap())
+        } else {
+            history.last().unwrap()
+        };
+        let latest_commit_sha = representative.commit_sha.clone();
         results.push(ComputedTestFlakiness {
             item: TestRegressionItem {
                 crate_name,
@@ -354,10 +419,16 @@ fn compute_test_flakiness_internal(
                     .or(latest_failure_summary),
             },
             ran_on_candidate,
+            latest_commit_sha,
+            candidate_flip_flops,
+            failure_episodes,
         });
     }
 
-    Ok(results)
+    Ok(TestFlakinessComputation {
+        items: results,
+        latest_binary_commit,
+    })
 }
 
 /// Evaluates a full [`RegressionGateRequest`] combining hardware-stratified benchmark regressions
@@ -404,11 +475,14 @@ pub fn evaluate_regression_gate(
     let mut flaky_warning = false;
     let mut flaky_or_failed_tests = Vec::new();
 
-    for computed in all_tests {
+    for computed in all_tests.items {
         let t = computed.item;
         let ignored = is_ignored_status(&t.status);
         let failed = computed.ran_on_candidate && !ignored && !is_pass_status(&t.status);
-        let flaky = !ignored && (t.flakiness_pct > max_flakiness || t.flip_flop_count > 0);
+        let actively_flaky = computed.candidate_flip_flops > 0
+            || (computed.failure_episodes >= 2
+                && (t.flakiness_pct > max_flakiness || t.flip_flop_count > 0));
+        let flaky = !ignored && !failed && actively_flaky;
         if failed {
             hard_test_failure = true;
             flaky_or_failed_tests.push(t);
@@ -818,5 +892,122 @@ mod tests {
         assert_eq!(report.flaky_or_failed_tests.len(), 1);
         assert_eq!(report.flaky_or_failed_tests[0].test_binary, "cargo-miri");
         assert_eq!(report.flaky_or_failed_tests[0].status, "failed");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_fixed_test_clears_alert_and_passes_regression_gate_immediately() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let base_ts = 1_700_000_000_000_000_000i64;
+        let mk_run = |idx: i64, sha: &str, bin: &str, test: &str, status: &str| TestCaseRunEntry {
+            job_id: format!("job-{idx}"),
+            repo_key: "lma1980/jero-core".into(),
+            branch_key: "main".into(),
+            commit_sha: sha.into(),
+            crate_name: "jero-core".into(),
+            test_binary: bin.into(),
+            test_name: test.into(),
+            status: status.into(),
+            duration_ms: 2.5,
+            failure_summary: if status == "failed" {
+                Some("assertion failed".into())
+            } else {
+                None
+            },
+            timestamp_unix_nano: base_ts + idx * 1_000_000_000,
+            node_id: "worker-x86_64".into(),
+            arch: "x86_64".into(),
+        };
+
+        // 1. Failing tests on sha-1 appear as active failing alerts across both binaries.
+        store
+            .insert_test_runs_batch(&[
+                mk_run(1, "sha-1", "cargo-test", "test_direct_fix", "failed"),
+                mk_run(2, "sha-1", "cargo-test", "test_ok_fail_ok", "ok"),
+                mk_run(
+                    3,
+                    "sha-1",
+                    "cargo-test",
+                    "test_removed_or_renamed",
+                    "failed",
+                ),
+                mk_run(4, "sha-1", "cargo-miri", "test_miri_ignored_fix", "failed"),
+            ])
+            .unwrap();
+        let active_1 =
+            compute_active_failing_tests_with_min_ts(&store, "lma1980/jero-core", 30, None, None)
+                .unwrap();
+        assert_eq!(active_1.len(), 3);
+
+        // 2. sha-2: test_direct_fix passes, test_ok_fail_ok breaks, test_removed_or_renamed is deleted
+        // (absent from sha-2 cargo-test run), and test_miri_ignored_fix is marked #[cfg_attr(miri, ignore)].
+        store
+            .insert_test_runs_batch(&[
+                mk_run(5, "sha-2", "cargo-test", "test_direct_fix", "ok"),
+                mk_run(6, "sha-2", "cargo-test", "test_ok_fail_ok", "failed"),
+                mk_run(7, "sha-2", "cargo-miri", "test_miri_ignored_fix", "ignored"),
+            ])
+            .unwrap();
+        let active_2 =
+            compute_active_failing_tests_with_min_ts(&store, "lma1980/jero-core", 30, None, None)
+                .unwrap();
+        assert_eq!(active_2.len(), 1);
+        assert_eq!(active_2[0].0.test_name, "test_ok_fail_ok");
+
+        // 3. sha-3: test_ok_fail_ok is fixed and passes -> zero active alerts and regression gate passes immediately.
+        store
+            .insert_test_runs_batch(&[
+                mk_run(8, "sha-3", "cargo-test", "test_direct_fix", "ok"),
+                mk_run(9, "sha-3", "cargo-test", "test_ok_fail_ok", "ok"),
+                mk_run(
+                    10,
+                    "sha-3",
+                    "cargo-miri",
+                    "test_miri_ignored_fix",
+                    "ignored",
+                ),
+            ])
+            .unwrap();
+        let active_3 =
+            compute_active_failing_tests_with_min_ts(&store, "lma1980/jero-core", 30, None, None)
+                .unwrap();
+        assert!(active_3.is_empty());
+
+        let report_3 = evaluate_regression_gate(
+            &store,
+            &RegressionGateRequest {
+                request_id: "gate-fixed".into(),
+                repo_key: "lma1980/jero-core".into(),
+                candidate_commit: "sha-3".into(),
+                baseline_branch: "main".into(),
+                max_slowdown_pct: 10.0,
+                max_flakiness_pct: 5.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(report_3.verdict, RegressionVerdict::Pass);
+        assert!(report_3.flaky_or_failed_tests.is_empty());
+
+        // 4. Same-commit flip-flop on candidate sha-4 still triggers Warn.
+        store
+            .insert_test_runs_batch(&[
+                mk_run(11, "sha-4", "cargo-test", "test_direct_fix", "failed"),
+                mk_run(12, "sha-4", "cargo-test", "test_direct_fix", "ok"),
+            ])
+            .unwrap();
+        let report_4 = evaluate_regression_gate(
+            &store,
+            &RegressionGateRequest {
+                request_id: "gate-same-sha-flake".into(),
+                repo_key: "lma1980/jero-core".into(),
+                candidate_commit: "sha-4".into(),
+                baseline_branch: "main".into(),
+                max_slowdown_pct: 10.0,
+                max_flakiness_pct: 5.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(report_4.verdict, RegressionVerdict::Warn);
+        assert_eq!(report_4.flaky_or_failed_tests.len(), 1);
     }
 }

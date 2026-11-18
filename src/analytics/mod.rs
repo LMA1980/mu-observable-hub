@@ -24,8 +24,9 @@ pub use purepath::{
     TraceSummaryDto,
 };
 pub use regression::{
-    compute_test_flakiness, compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions,
-    evaluate_regression_gate, FlakyTestItem, DEFAULT_BASELINE_WINDOW, DEFAULT_MAX_MAD_Z_SCORE,
+    compute_active_failing_tests_with_min_ts, compute_test_flakiness,
+    compute_test_flakiness_with_min_ts, evaluate_benchmark_regressions, evaluate_regression_gate,
+    FlakyTestItem, DEFAULT_BASELINE_WINDOW, DEFAULT_MAX_MAD_Z_SCORE,
 };
 pub use slo::evaluate_canary_slo;
 pub use smartscape::{
