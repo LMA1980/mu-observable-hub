@@ -6,7 +6,9 @@
 //! call dependency graph to isolate the originating root-cause service, and correlates
 //! contemporaneous error logs from `v_logs`.
 
-use crate::analytics::exclusions::{is_batch_ci_execution_span, MonitoringExclusions};
+use crate::analytics::exclusions::{
+    is_batch_ci_execution_span, is_user_ci_failure_span, MonitoringExclusions,
+};
 use crate::error::MuObserveError;
 use crate::server::sanitize::PrivacyRedactor;
 use crate::storage::HotDuckDbStore;
@@ -135,7 +137,7 @@ pub fn compute_causal_problems_with_exclusions(
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT service_name, duration_ns, UPPER(status_code), span_name
+        SELECT service_name, duration_ns, UPPER(status_code), span_name, COALESCE(attributes_json, '')
         FROM v_traces
         WHERE start_time_unix_nano >= ?1
         "#,
@@ -158,6 +160,7 @@ pub fn compute_causal_problems_with_exclusions(
         let duration_ns: i64 = row.get(1)?;
         let status: String = row.get(2)?;
         let span_name: String = row.get(3)?;
+        let attrs_json: String = row.get(4)?;
 
         let entry = service_map.entry(svc).or_insert_with(|| ServiceStats {
             durations: Vec::new(),
@@ -170,7 +173,7 @@ pub fn compute_causal_problems_with_exclusions(
                 .durations
                 .push((duration_ns.max(0) as f64) / 1_000_000.0);
         }
-        if status == "ERROR" {
+        if status == "ERROR" && !is_user_ci_failure_span(&span_name, &attrs_json) {
             entry.error_count += 1;
         }
     }
@@ -233,17 +236,30 @@ pub fn compute_causal_problems_with_exclusions(
 
         // Find representative anomalous trace for this service
         let trace_id_opt: Option<String> = if stats.error_count > 0 {
-            conn.query_row(
+            conn.prepare(
                 r#"
-                SELECT trace_id
+                SELECT trace_id, span_name, COALESCE(attributes_json, '')
                 FROM v_traces
                 WHERE service_name = ?1 AND start_time_unix_nano >= ?2 AND UPPER(status_code) = 'ERROR'
-                ORDER BY start_time_unix_nano DESC LIMIT 1
+                ORDER BY start_time_unix_nano DESC
                 "#,
-                params![service_name, cutoff_ts],
-                |r| r.get(0),
             )
             .ok()
+            .and_then(|mut s| {
+                let mut found = None;
+                if let Ok(mut qrows) = s.query(params![service_name, cutoff_ts]) {
+                    while let Ok(Some(r)) = qrows.next() {
+                        let tid: String = r.get(0).unwrap_or_default();
+                        let sn: String = r.get(1).unwrap_or_default();
+                        let attrs: String = r.get(2).unwrap_or_default();
+                        if !is_user_ci_failure_span(&sn, &attrs) {
+                            found = Some(tid);
+                            break;
+                        }
+                    }
+                }
+                found
+            })
         } else {
             conn.query_row(
                 r#"

@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::analytics::causal::compute_causal_problems_with_exclusions;
-use crate::analytics::exclusions::{MonitoringExclusions, MonitoringExclusionsUpdateRequest};
+use crate::analytics::exclusions::{
+    is_ci_regression_problem_category, MonitoringExclusions, MonitoringExclusionsUpdateRequest,
+};
 use crate::analytics::purepath::{
     compute_purepath_waterfall, list_trace_summaries, TraceListFilter, TraceListQuery,
 };
@@ -548,6 +550,12 @@ async fn collect_causal_problem_cards(
     let mut all_problems = causal_problems;
     if let Some(feed) = deterministic_feed {
         for dp in feed.problems {
+            if is_ci_regression_problem_category(&dp.category)
+                || dp.problem_id.starts_with("PROB-TEST-")
+                || dp.problem_id.starts_with("PROB-BENCH-")
+            {
+                continue;
+            }
             if !all_problems
                 .iter()
                 .any(|cp| cp.impacted_entity == dp.impacted_entity)

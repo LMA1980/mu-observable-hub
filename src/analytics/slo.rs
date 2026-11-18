@@ -1,7 +1,7 @@
 use duckdb::params;
 use mu_observable_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
 
-use crate::analytics::exclusions::is_batch_ci_execution_span;
+use crate::analytics::exclusions::{is_batch_ci_execution_span, is_user_ci_failure_span};
 use crate::error::MuObserveError;
 use crate::storage::hot_duckdb::HotDuckDbStore;
 
@@ -92,7 +92,7 @@ pub fn evaluate_canary_slo(
     // Gather interactive span durations in the bake window to compute p99 latency in milliseconds
     let mut span_stmt = conn.prepare(
         r#"
-        SELECT duration_ns, status_code, span_name
+        SELECT duration_ns, status_code, span_name, COALESCE(attributes_json, '')
         FROM v_traces
         WHERE service_name = ?1
           AND (?2 IS NULL OR node_id = ?2)
@@ -107,17 +107,19 @@ pub fn evaluate_canary_slo(
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?;
 
     let mut durations_ms = Vec::new();
     let mut error_spans = 0u32;
     for sr in span_rows {
-        let (dur_ns, status, span_name) = sr?;
+        let (dur_ns, status, span_name, attrs_json) = sr?;
         if !is_batch_ci_execution_span(&span_name) {
             durations_ms.push((dur_ns.max(0) as f64) / 1_000_000.0);
         }
-        if status.eq_ignore_ascii_case("ERROR") {
+        if status.eq_ignore_ascii_case("ERROR") && !is_user_ci_failure_span(&span_name, &attrs_json)
+        {
             error_spans = error_spans.saturating_add(1);
         }
     }
