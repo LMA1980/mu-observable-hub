@@ -1,15 +1,15 @@
 ---
 name: mu-observable-hub
-description: "Query and analyze distributed OpenTelemetry logs, W3C trace waterfalls, hardware-stratified SpacemiT K3 (X100 vs A100) benchmark regressions, 30-day test flakiness, canary deployment SLOs, and guarded DuckDB/Parquet SQL analytics via mu-observable-mcp and mu-observable-cli."
+description: "Query and analyze distributed OpenTelemetry logs, W3C trace waterfalls, hardware-stratified SpacemiT K3 (X100 vs A100) benchmark regressions, 30-day test flakiness, canary deployment SLOs, and guarded DuckDB/Parquet SQL analytics via mu-observable-hub-mcp and mu-observable-hub-cli."
 ---
 
 # `mu-observable-hub` Observability, Regression Analytics & MCP Usage
 
 Use this skill when investigating CI pipeline failures, W3C distributed traces, hardware-stratified benchmark regressions across SpacemiT K3 Cluster 0 (`X100`, `VLEN=256`) and Cluster 1 (`A100`, `VLEN=1024`) vs `x86_64`, evaluating canary deployment SLOs, or running read-only analytical SQL queries against `mu-observable-hub`.
 
-## 1. MCP Server Tools (`mu-observable-mcp`)
+## 1. MCP Server Tools (`mu-observable-hub-mcp`)
 
-`mu-observable-mcp` exposes 10 structured JSON-RPC 2.0 MCP tools over `stdio` or HTTP:
+`mu-observable-hub-mcp` exposes 10 structured JSON-RPC 2.0 MCP tools over `stdio` or HTTP:
 
 | MCP Tool Name | Required Arguments | Purpose |
 | :--- | :--- | :--- |
@@ -24,28 +24,32 @@ Use this skill when investigating CI pipeline failures, W3C distributed traces, 
 | `compare_cluster_efficiency` | *(optional)* `repo_key`, `bench_name` | Compares SpacemiT K3 Cluster 0 (`X100`, `VLEN=256`) vs Cluster 1 (`A100`, `VLEN=1024`) vs `x86_64` execution efficiency. |
 | `execute_analytics_sql` | `sql` | Executes a guarded read-only DuckDB query (`SELECT`/`WITH`/`EXPLAIN` only; DDL/DML/ATTACH/COPY rejected; 5s timeout; 1,000-row cap). |
 
-## 2. CLI Subcommand (`cargo agents mu-observable-hub` / `mu-observable-cli`)
+## 2. CLI Subcommand (`cargo agents mu-observable-hub` / `mu-observable-hub-cli`)
 
 ```bash
 # Check hardware-stratified benchmark & test regressions for a candidate commit
-mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-hub-cli --db /var/lib/mu-observable-hub/hot.duckdb \
   regressions --repo lma1980/k3-core --commit HEAD --baseline main
 
 # Evaluate canary service SLO over a 300s bake window
-mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
-  slo --service action-runner-controller --digest HEAD --window-secs 300 --max-errors 0 --max-p99-ms 250.0
+mu-observable-hub-cli --db /var/lib/mu-observable-hub/hot.duckdb \
+  slo --service mu-ci-controller --digest HEAD --window-secs 300 --max-errors 0 --max-p99-ms 250.0
 
 # Inspect a W3C trace waterfall and correlated logs
-mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-hub-cli --db /var/lib/mu-observable-hub/hot.duckdb \
   traces --trace-id <32-hex-trace-id>
 
 # Join and query across unified hot DuckDB + cold Parquet views
-mu-observable-cli --db /var/lib/muobserve/db/muobserve.duckdb \
+mu-observable-hub-cli --db /var/lib/mu-observable-hub/hot.duckdb \
   sql --query "SELECT repo_key, status_state, COUNT(*) AS jobs FROM v_jobs_history GROUP BY repo_key, status_state ORDER BY jobs DESC"
+
+# Compact aged hot telemetry into Zstd Parquet and enforce cold TTL / FIFO limits
+mu-observable-hub-cli compact --db /var/lib/mu-observable-hub/hot.duckdb \
+  --parquet-root /var/lib/mu-observable-hub/parquet
 ```
 
 ## 3. Line-Indexed Log Store & Strict FIFO Eviction Invariants
 
 - **1 Line = 1 Record (`otel_logs`)**: Every log line is stored individually with `line_no`, `stream` (`1` = stdout, `2` = stderr), and 64-bit FNV-1a `dedup_hash`. Full-file `job_logs_store` (`__ar_job_logs__`) blobs are retired; `/api/v1/jobs/{job_id}/log` reconstructs logs from `v_logs` ordered by `(line_no ASC, timestamp_unix_nano ASC)`.
 - **Inverted Token Index (`log_inverted_index`) & Shard Catalog (`log_shards_catalog`)**: Each inserted log line indexes up to 32 normalized lowercase tokens in `log_inverted_index` and tracks segment placement across `hot`, `cold_parquet`, and `cold_s3`.
-- **Strict FIFO Time & Disk-Space Eviction**: `enforce_fifo_time_and_space_eviction` evicts oldest shards and rows strictly by timestamp when TTL expires or `libc::statvfs` free disk bytes (`MUOBSERVE_MIN_FREE_DISK_BYTES`, default `2 GiB`) / total store bytes (`MUOBSERVE_MAX_STORE_BYTES`, default `4 GiB`) crosses threshold.
+- **Strict FIFO Time & Disk-Space Eviction**: `enforce_fifo_time_and_space_eviction` evicts oldest shards and rows strictly by timestamp when TTL expires or `libc::statvfs` free disk bytes (`MU_OBSERVABLE_HUB_MIN_FREE_DISK_BYTES`, default `2 GiB`) / total store bytes (`MU_OBSERVABLE_HUB_MAX_STORE_BYTES`, default `4 GiB`) crosses threshold.

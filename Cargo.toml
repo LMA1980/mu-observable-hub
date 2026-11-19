@@ -16,6 +16,14 @@ name = "mu-observable-hub"
 path = "src/main.rs"
 
 [[bin]]
+name = "mu-observable-hub-mcp"
+path = "src/bin/muobserve_mcp.rs"
+
+[[bin]]
+name = "mu-observable-hub-cli"
+path = "src/bin/muobserve_cli.rs"
+
+[[bin]]
 name = "mu-observable-mcp"
 path = "src/bin/muobserve_mcp.rs"
 

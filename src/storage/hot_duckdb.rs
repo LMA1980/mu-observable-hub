@@ -360,11 +360,14 @@ impl HotDuckDbStore {
             None => Connection::open_in_memory()?,
         };
 
-        let flush_interval_ms = std::env::var("MUOBSERVE_FLUSH_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|s| s.clamp(1, 3600) * 1000)
-            .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
+        let flush_interval_ms = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_FLUSH_INTERVAL_SECS",
+            "MU_OBSERVABLE_FLUSH_INTERVAL_SECS",
+            "MUOBSERVE_FLUSH_INTERVAL_SECS",
+        ])
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|s| s.clamp(1, 3600) * 1000)
+        .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS);
 
         let (event_tx, _) = tokio::sync::broadcast::channel(2048);
         let store = Self {
@@ -447,15 +450,20 @@ impl HotDuckDbStore {
         {
             let conn = self.lock_conn()?;
             if self.db_path.is_some() {
-                let mem_limit = std::env::var("MUOBSERVE_DUCKDB_MEMORY_LIMIT")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "1GB".to_string());
-                let threads: usize = std::env::var("MUOBSERVE_DUCKDB_THREADS")
-                    .ok()
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(2)
-                    .clamp(1, 16);
+                let mem_limit = crate::config::non_empty_env_first(&[
+                    "MU_OBSERVABLE_HUB_DUCKDB_MEMORY_LIMIT",
+                    "MU_OBSERVABLE_DUCKDB_MEMORY_LIMIT",
+                    "MUOBSERVE_DUCKDB_MEMORY_LIMIT",
+                ])
+                .unwrap_or_else(|| "1GB".to_string());
+                let threads: usize = crate::config::non_empty_env_first(&[
+                    "MU_OBSERVABLE_HUB_DUCKDB_THREADS",
+                    "MU_OBSERVABLE_DUCKDB_THREADS",
+                    "MUOBSERVE_DUCKDB_THREADS",
+                ])
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2)
+                .clamp(1, 16);
                 let _ = conn.execute_batch(&format!(
                     "SET memory_limit = '{}'; SET threads = {}; SET allocator_flush_threshold = '16MB'; SET wal_autocheckpoint = '64MB';",
                     mem_limit.replace('\'', ""),
@@ -1341,16 +1349,24 @@ impl HotDuckDbStore {
     }
 
     /// Evicts expired logs, spans, metrics, and cold shards older than `now_ns - max_age_ns`,
-    /// while also enforcing any configured `MUOBSERVE_MAX_STORE_BYTES` and `MUOBSERVE_MIN_FREE_DISK_BYTES`.
+    /// while also enforcing any configured `MU_OBSERVABLE_HUB_MAX_STORE_BYTES` /
+    /// `MUOBSERVE_MAX_STORE_BYTES` and `MU_OBSERVABLE_HUB_MIN_FREE_DISK_BYTES` /
+    /// `MUOBSERVE_MIN_FREE_DISK_BYTES`.
     pub fn evict_expired_logs(&self, now_ns: i64, max_age_ns: i64) -> Result<usize, StorageError> {
-        let max_store_bytes = std::env::var("MUOBSERVE_MAX_STORE_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MAX_STORE_BYTES);
-        let min_free_disk_bytes = std::env::var("MUOBSERVE_MIN_FREE_DISK_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+        let max_store_bytes = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_MAX_STORE_BYTES",
+            "MU_OBSERVABLE_MAX_STORE_BYTES",
+            "MUOBSERVE_MAX_STORE_BYTES",
+        ])
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_STORE_BYTES);
+        let min_free_disk_bytes = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_MIN_FREE_DISK_BYTES",
+            "MU_OBSERVABLE_MIN_FREE_DISK_BYTES",
+            "MUOBSERVE_MIN_FREE_DISK_BYTES",
+        ])
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
         self.enforce_fifo_time_and_space_eviction(
             now_ns,
             max_age_ns,

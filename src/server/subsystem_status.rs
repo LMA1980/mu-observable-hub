@@ -972,7 +972,7 @@ pub struct CausalMaintenanceFilterOutcome {
 #[must_use]
 pub fn classify_service_subsystem(service_name: &str) -> Option<PlatformSubsystemId> {
     let lower = service_name.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    if lower.is_empty() || lower.contains('/') {
         return None;
     }
 
@@ -988,6 +988,8 @@ pub fn classify_service_subsystem(service_name: &str) -> Option<PlatformSubsyste
     if lower == "cd"
         || lower.contains("muconde")
         || lower.contains("mu-conde")
+        || lower.contains("mu-cd")
+        || lower.contains("mucd")
         || lower.contains("deploy-agent")
     {
         return Some(PlatformSubsystemId::Cd);
@@ -1011,6 +1013,9 @@ pub fn classify_service_subsystem(service_name: &str) -> Option<PlatformSubsyste
         || lower.contains("muobserve")
         || lower.contains("mu-observe")
         || lower.contains("mu-observable")
+        || lower.contains("muobservable")
+        || lower.contains("musentinel")
+        || lower.contains("mu-sentinel")
         || lower.contains("otel")
         || lower.contains("duckdb")
     {
@@ -1021,9 +1026,17 @@ pub fn classify_service_subsystem(service_name: &str) -> Option<PlatformSubsyste
         || lower.contains("model_runner")
         || lower.contains("model-runner")
         || lower.contains("modelrunner")
+        || lower.contains("jero-manager")
+        || lower.contains("jero-engine")
+        || lower.contains("jero-kv")
+        || lower.contains("jero-runner")
+        || lower.starts_with("jero-")
+        || lower.contains("k3-manager")
         || lower.contains("k3-engine")
+        || lower.contains("k3-kv")
         || lower.contains("k3-server")
         || lower.contains("k3-diag")
+        || lower.starts_with("k3-")
         || lower.contains("inference")
     {
         return Some(PlatformSubsystemId::ModelRunner);
@@ -1049,6 +1062,12 @@ pub fn classify_problem_subsystem(
     affected_services: &[String],
     category: &str,
 ) -> Option<PlatformSubsystemId> {
+    if matches!(
+        category.trim().to_ascii_lowercase().as_str(),
+        "benchmark_regression" | "test_flakiness"
+    ) {
+        return Some(PlatformSubsystemId::Ci);
+    }
     if let Some(sub) = classify_service_subsystem(impacted_entity) {
         return Some(sub);
     }
@@ -1062,7 +1081,6 @@ pub fn classify_problem_subsystem(
     }
 
     match category.trim().to_ascii_lowercase().as_str() {
-        "benchmark_regression" | "test_flakiness" => Some(PlatformSubsystemId::Ci),
         "canary_taint" => Some(PlatformSubsystemId::AbDeploy),
         "heartbeat_staleness" => Some(PlatformSubsystemId::Platform),
         _ => None,
@@ -1181,36 +1199,9 @@ fn find_matching_upstream(
     id: PlatformSubsystemId,
     upstreams: &[IngressUpstreamDto],
 ) -> Option<&IngressUpstreamDto> {
-    upstreams.iter().find(|u| {
-        let svc = u.service_name.to_ascii_lowercase();
-        match id {
-            PlatformSubsystemId::Ci => {
-                svc.contains("actionrunner")
-                    || svc.contains("action-runner")
-                    || svc.contains("muci")
-                    || svc == "ci"
-            }
-            PlatformSubsystemId::Cd => svc.contains("muconde") || svc == "cd",
-            PlatformSubsystemId::AbDeploy => {
-                svc.contains("canary") || svc.contains("ab_deploy") || svc.contains("ab-deploy")
-            }
-            PlatformSubsystemId::Repository => {
-                svc.contains("muregist") || svc.contains("registry") || svc == "repository"
-            }
-            PlatformSubsystemId::Observability => {
-                svc.contains("muobserve") || svc == "observability"
-            }
-            PlatformSubsystemId::ModelRunner => {
-                svc.contains("model-runner")
-                    || svc.contains("model_runner")
-                    || svc.contains("k3-engine")
-                    || svc.contains("k3-server")
-            }
-            PlatformSubsystemId::Platform => {
-                svc.contains("mu-console") || svc == "platform" || svc.contains("control-plane")
-            }
-        }
-    })
+    upstreams
+        .iter()
+        .find(|u| classify_service_subsystem(&u.service_name) == Some(id))
 }
 
 fn map_upstream_probe(up: &IngressUpstreamDto) -> (SubsystemHealthState, String) {
@@ -1475,5 +1466,78 @@ mod tests {
             .find(|c| c.problem_id == "P3")
             .unwrap();
         assert_eq!(p3.maintenance_suppressed, None);
+    }
+
+    #[test]
+    fn test_canonical_and_legacy_service_subsystem_and_upstream_attribution() {
+        let expected = [
+            // Canonical M9 service names
+            ("mu-observable-sentinel", PlatformSubsystemId::Observability),
+            (
+                "mu-observable-collector",
+                PlatformSubsystemId::Observability,
+            ),
+            ("mu-observable-hub", PlatformSubsystemId::Observability),
+            ("mu-registry", PlatformSubsystemId::Repository),
+            ("mu-ci-controller", PlatformSubsystemId::Ci),
+            ("mu-ci-worker", PlatformSubsystemId::Ci),
+            ("mu-cd-controller", PlatformSubsystemId::Cd),
+            ("mu-cd-agent", PlatformSubsystemId::Cd),
+            ("jero-manager", PlatformSubsystemId::ModelRunner),
+            ("jero-engine", PlatformSubsystemId::ModelRunner),
+            ("jero-kv-cache", PlatformSubsystemId::ModelRunner),
+            ("jero-runner", PlatformSubsystemId::ModelRunner),
+            // Legacy Phase 1 aliases
+            ("musentinel", PlatformSubsystemId::Observability),
+            ("muregist", PlatformSubsystemId::Repository),
+            ("actionrunner-controller", PlatformSubsystemId::Ci),
+            ("actionrunner-rs", PlatformSubsystemId::Ci),
+            ("action-runner-controller", PlatformSubsystemId::Ci),
+            ("action-runner-worker", PlatformSubsystemId::Ci),
+            ("muconde-controller", PlatformSubsystemId::Cd),
+            ("muconde-agent", PlatformSubsystemId::Cd),
+            ("muobserve", PlatformSubsystemId::Observability),
+            ("muobserve-collector", PlatformSubsystemId::Observability),
+            ("k3-manager", PlatformSubsystemId::ModelRunner),
+            ("k3-engine", PlatformSubsystemId::ModelRunner),
+            ("model-runner", PlatformSubsystemId::ModelRunner),
+        ];
+
+        for (svc, subsystem) in expected {
+            assert_eq!(
+                classify_service_subsystem(svc),
+                Some(subsystem),
+                "service '{svc}' failed subsystem classification"
+            );
+
+            let upstream = IngressUpstreamDto {
+                upstream_id: format!("upstream-{svc}"),
+                target_url: "http://127.0.0.1:9000/".into(),
+                service_name: svc.into(),
+                health_state: "DEGRADED".into(),
+                latency_ms: 12.0,
+                success_rate_pct: 95.0,
+                active_connections: 1,
+                last_check_ms: 1_700_000_000_000,
+            };
+            let upstreams = [upstream];
+            let matched = find_matching_upstream(subsystem, &upstreams);
+            assert!(
+                matched.is_some(),
+                "upstream with service '{svc}' should match {subsystem:?}"
+            );
+        }
+
+        // Repo keys in CI regressions still attribute to Ci (not ModelRunner)
+        assert_eq!(classify_service_subsystem("lma1980/k3-engine"), None);
+        assert_eq!(
+            classify_problem_subsystem(
+                "lma1980/k3-engine",
+                "lma1980/k3-engine",
+                &[],
+                "benchmark_regression"
+            ),
+            Some(PlatformSubsystemId::Ci)
+        );
     }
 }

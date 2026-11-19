@@ -566,9 +566,14 @@ async fn call_chat_completion(base_url: &str, prompt: &str) -> Result<String, St
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        if let Ok(ca_path) =
-            std::env::var("MUOBSERVE_TLS_CA").or_else(|_| std::env::var("SSL_CERT_FILE"))
-        {
+        if let Some(ca_path) = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_TLS_CA",
+            "MU_OBSERVABLE_HUB_CA_CERT",
+            "MU_OBSERVABLE_TLS_CA",
+            "MUOBSERVE_TLS_CA",
+            "MUOBSERVE_CA_CERT",
+            "SSL_CERT_FILE",
+        ]) {
             if let Ok(ca_file) = std::fs::File::open(&ca_path) {
                 use rustls::pki_types::pem::PemObject;
                 let mut reader = std::io::BufReader::new(ca_file);

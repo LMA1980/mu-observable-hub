@@ -4,6 +4,7 @@
 
 pub mod analytics;
 pub mod cli;
+pub mod config;
 pub mod error;
 pub mod ingress;
 pub mod mcp;
@@ -38,6 +39,10 @@ pub use analytics::{
 pub use cli::{
     execute_cli_command, migrate_actionrunner_duckdb, parse_cli_args, ActionRunnerMigrationReport,
     CliCommand,
+};
+pub use config::{
+    env_var_first, non_empty_env_first, parse_bool_env_first, resolve_db_path,
+    resolve_parquet_root, resolve_path_with_fallback, resolve_secret_env_pairs, resolve_tls_paths,
 };
 pub use error::{MuObserveError, StorageError};
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, MCP_TOOL_NAMES};

@@ -10,9 +10,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use mu_auth::{
     canonical_super_operator_folios, constant_time_str_eq, evaluate_session, resolve_secret_value,
-    resolve_secret_with_file_var, EdgeAuthConfig, FolioCatalog, FolioError, FolioId,
-    GithubEdgeAuthAdapter, Principal, RoleCatalog, RoleFolioIndex, RoleId, RoleLease, RoleLeases,
-    RoleSpec, StepUpRequirement, SUPER_OPERATOR_ROLE_ID,
+    EdgeAuthConfig, FolioCatalog, FolioError, FolioId, GithubEdgeAuthAdapter, Principal,
+    RoleCatalog, RoleFolioIndex, RoleId, RoleLease, RoleLeases, RoleSpec, StepUpRequirement,
+    SUPER_OPERATOR_ROLE_ID,
 };
 use serde_json::json;
 
@@ -145,26 +145,61 @@ impl Default for MuAuthFolioVerifier {
 impl MuAuthFolioVerifier {
     /// Constructs a verifier from environment configuration.
     ///
-    /// - When `MUOBSERVE_PROXY_SECRET` / `MUOBSERVE_PROXY_SECRET_FILE` is configured, edge
-    ///   proxy authentication is strictly enforced via [`GithubEdgeAuthAdapter`], and anonymous
-    ///   visitors receive only `folio:system:status` unless overridden by `MUOBSERVE_ANONYMOUS_FOLIOS`
-    ///   or `MUOBSERVE_ANONYMOUS_LOCKDOWN=true`.
-    /// - When `MUOBSERVE_ANONYMOUS_LOCKDOWN=true`, anonymous visitors receive `[]` (returning `401` on all endpoints).
+    /// - When `MU_OBSERVABLE_HUB_PROXY_SECRET` / `MU_OBSERVABLE_HUB_PROXY_SECRET_FILE` (or legacy
+    ///   `MU_OBSERVABLE_PROXY_SECRET*` / `MUOBSERVE_PROXY_SECRET*`) is configured, edge proxy
+    ///   authentication is strictly enforced via [`GithubEdgeAuthAdapter`], and anonymous visitors
+    ///   receive only `folio:system:status` unless overridden by
+    ///   `MU_OBSERVABLE_HUB_ANONYMOUS_FOLIOS` / `MUOBSERVE_ANONYMOUS_FOLIOS` or
+    ///   `MU_OBSERVABLE_HUB_ANONYMOUS_LOCKDOWN=true`.
+    /// - When `MU_OBSERVABLE_HUB_ANONYMOUS_LOCKDOWN=true`, anonymous visitors receive `[]`
+    ///   (returning `401` on all endpoints).
     #[must_use]
     pub fn from_env() -> Self {
-        let edge_adapter = EdgeAuthConfig::from_env(
-            "MUOBSERVE_PROXY_SECRET",
-            "MUOBSERVE_PROXY_SECRET_FILE",
-            false,
-        )
-        .ok()
-        .map(GithubEdgeAuthAdapter::new);
+        let proxy_secret = crate::config::resolve_secret_env_pairs(&[
+            (
+                "MU_OBSERVABLE_HUB_PROXY_SECRET",
+                "MU_OBSERVABLE_HUB_PROXY_SECRET_FILE",
+            ),
+            (
+                "MU_OBSERVABLE_PROXY_SECRET",
+                "MU_OBSERVABLE_PROXY_SECRET_FILE",
+            ),
+            ("MUOBSERVE_PROXY_SECRET", "MUOBSERVE_PROXY_SECRET_FILE"),
+        ]);
+        let edge_adapter = EdgeAuthConfig::with_secret_and_loopback(proxy_secret.as_deref(), false)
+            .ok()
+            .map(GithubEdgeAuthAdapter::new);
 
-        let lockdown = parse_bool_env("MUOBSERVE_ANONYMOUS_LOCKDOWN", false);
-        let explicit_folios = std::env::var("MUOBSERVE_ANONYMOUS_FOLIOS").ok();
-        let status_flag = parse_bool_env("MUOBSERVE_ANONYMOUS_STATUS_READ", true);
+        let lockdown = crate::config::parse_bool_env_first(
+            &[
+                "MU_OBSERVABLE_HUB_ANONYMOUS_LOCKDOWN",
+                "MU_OBSERVABLE_ANONYMOUS_LOCKDOWN",
+                "MUOBSERVE_ANONYMOUS_LOCKDOWN",
+            ],
+            false,
+        );
+        let explicit_folios = crate::config::env_var_first(&[
+            "MU_OBSERVABLE_HUB_ANONYMOUS_FOLIOS",
+            "MU_OBSERVABLE_ANONYMOUS_FOLIOS",
+            "MUOBSERVE_ANONYMOUS_FOLIOS",
+        ]);
+        let status_flag = crate::config::parse_bool_env_first(
+            &[
+                "MU_OBSERVABLE_HUB_ANONYMOUS_STATUS_READ",
+                "MU_OBSERVABLE_ANONYMOUS_STATUS_READ",
+                "MUOBSERVE_ANONYMOUS_STATUS_READ",
+            ],
+            true,
+        );
         let default_obs = edge_adapter.is_none();
-        let obs_flag = parse_bool_env("MUOBSERVE_ANONYMOUS_OBS_READ", default_obs);
+        let obs_flag = crate::config::parse_bool_env_first(
+            &[
+                "MU_OBSERVABLE_HUB_ANONYMOUS_OBS_READ",
+                "MU_OBSERVABLE_ANONYMOUS_OBS_READ",
+                "MUOBSERVE_ANONYMOUS_OBS_READ",
+            ],
+            default_obs,
+        );
 
         let anon_folio_ids: Vec<String> = if lockdown {
             Vec::new()
@@ -184,7 +219,11 @@ impl MuAuthFolioVerifier {
         let anon_refs: Vec<&str> = anon_folio_ids.iter().map(String::as_str).collect();
         let verifier = Self::build_internal(edge_adapter, &anon_refs, None);
 
-        if let Some(op_users) = crate::ingress::non_empty_env("MUOBSERVE_OPERATOR_USERS") {
+        if let Some(op_users) = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_OPERATOR_USERS",
+            "MU_OBSERVABLE_OPERATOR_USERS",
+            "MUOBSERVE_OPERATOR_USERS",
+        ]) {
             let role_catalog = verifier.state.read().expect("lock").role_catalog.clone();
             let now_ms = current_epoch_ms();
             for login in op_users.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -766,15 +805,45 @@ pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn expected_service_token() -> Option<String> {
-    resolve_secret_with_file_var(
-        "MUOBSERVE_INGRESS_ADMIN_TOKEN",
-        "MUOBSERVE_INGRESS_ADMIN_TOKEN_FILE",
-    )
+    crate::config::resolve_secret_env_pairs(&[
+        (
+            "MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN",
+            "MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN_FILE",
+        ),
+        (
+            "MU_OBSERVABLE_INGRESS_ADMIN_TOKEN",
+            "MU_OBSERVABLE_INGRESS_ADMIN_TOKEN_FILE",
+        ),
+        (
+            "MUOBSERVE_INGRESS_ADMIN_TOKEN",
+            "MUOBSERVE_INGRESS_ADMIN_TOKEN_FILE",
+        ),
+    ])
     .or_else(|| {
-        resolve_secret_with_file_var("MUOBSERVE_OPERATOR_TOKEN", "MUOBSERVE_OPERATOR_TOKEN_FILE")
+        crate::config::resolve_secret_env_pairs(&[
+            (
+                "MU_OBSERVABLE_HUB_OPERATOR_TOKEN",
+                "MU_OBSERVABLE_HUB_OPERATOR_TOKEN_FILE",
+            ),
+            (
+                "MU_OBSERVABLE_OPERATOR_TOKEN",
+                "MU_OBSERVABLE_OPERATOR_TOKEN_FILE",
+            ),
+            ("MUOBSERVE_OPERATOR_TOKEN", "MUOBSERVE_OPERATOR_TOKEN_FILE"),
+        ])
     })
     .or_else(|| {
-        resolve_secret_with_file_var("MUOBSERVE_BEARER_TOKEN", "MUOBSERVE_BEARER_TOKEN_FILE")
+        crate::config::resolve_secret_env_pairs(&[
+            (
+                "MU_OBSERVABLE_HUB_BEARER_TOKEN",
+                "MU_OBSERVABLE_HUB_BEARER_TOKEN_FILE",
+            ),
+            (
+                "MU_OBSERVABLE_BEARER_TOKEN",
+                "MU_OBSERVABLE_BEARER_TOKEN_FILE",
+            ),
+            ("MUOBSERVE_BEARER_TOKEN", "MUOBSERVE_BEARER_TOKEN_FILE"),
+        ])
     })
 }
 
@@ -789,17 +858,6 @@ fn parse_anonymous_folio_list(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn parse_bool_env(key: &str, default: bool) -> bool {
-    match crate::ingress::non_empty_env(key) {
-        Some(v) => match v.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            _ => default,
-        },
-        None => default,
-    }
 }
 
 fn current_epoch_ms() -> u64 {
@@ -1070,5 +1128,73 @@ mod tests {
                 t0 + 1_040_000,
             )
             .is_err());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_canonical_hub_auth_env_precedence() {
+        static AUTH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = AUTH_ENV_LOCK.lock().expect("auth env lock");
+        let keys = [
+            "MU_OBSERVABLE_HUB_PROXY_SECRET",
+            "MU_OBSERVABLE_HUB_PROXY_SECRET_FILE",
+            "MU_OBSERVABLE_PROXY_SECRET",
+            "MU_OBSERVABLE_PROXY_SECRET_FILE",
+            "MUOBSERVE_PROXY_SECRET",
+            "MUOBSERVE_PROXY_SECRET_FILE",
+            "MU_OBSERVABLE_HUB_ANONYMOUS_FOLIOS",
+            "MU_OBSERVABLE_ANONYMOUS_FOLIOS",
+            "MUOBSERVE_ANONYMOUS_FOLIOS",
+            "MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN",
+            "MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN_FILE",
+            "MUOBSERVE_INGRESS_ADMIN_TOKEN",
+            "MUOBSERVE_INGRESS_ADMIN_TOKEN_FILE",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        std::env::set_var("MUOBSERVE_PROXY_SECRET", "legacy-edge-secret");
+        std::env::set_var("MU_OBSERVABLE_HUB_PROXY_SECRET", "hub-edge-secret");
+        std::env::set_var("MUOBSERVE_ANONYMOUS_FOLIOS", "folio:obs:read");
+        std::env::set_var("MU_OBSERVABLE_HUB_ANONYMOUS_FOLIOS", "folio:system:status");
+        std::env::set_var("MUOBSERVE_INGRESS_ADMIN_TOKEN", "legacy-admin");
+        std::env::set_var("MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN", "hub-admin");
+
+        let verifier = MuAuthFolioVerifier::from_env();
+        let empty = HeaderMap::new();
+        assert!(verifier
+            .authorize(&empty, ObsPermission::SystemStatusRead)
+            .is_ok());
+        assert!(verifier
+            .authorize(&empty, ObsPermission::ProblemsRead)
+            .is_err());
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer hub-admin"),
+        );
+        assert!(verifier
+            .authorize(&bearer, ObsPermission::IngressWrite)
+            .is_ok());
+
+        let mut legacy_bearer = HeaderMap::new();
+        legacy_bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer legacy-admin"),
+        );
+        assert!(verifier
+            .authorize(&legacy_bearer, ObsPermission::IngressWrite)
+            .is_err());
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

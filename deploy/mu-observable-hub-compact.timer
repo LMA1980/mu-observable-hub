@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Cold Parquet Compaction Timer for Mu-Observable Hub
+Documentation=https://github.com/LMA1980/mu-observable-hub
+After=mu-observable-hub.service
+
+[Timer]
+Unit=mu-observable-hub-compact.service
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

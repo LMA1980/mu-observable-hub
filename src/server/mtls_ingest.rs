@@ -126,6 +126,49 @@ pub fn resolve_san_identity(
     resolve_san_identity_from_list(&sans, allowed_dns_suffix)
 }
 
+/// Returns `true` when `name` matches a canonical M9 platform service name or a legacy Phase 1
+/// service alias.
+#[must_use]
+pub fn is_known_platform_service_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "mu-observable-sentinel"
+            | "mu-observable-collector"
+            | "mu-observable-hub"
+            | "mu-registry"
+            | "mu-ci-controller"
+            | "mu-ci-worker"
+            | "mu-cd-controller"
+            | "mu-cd-agent"
+            | "jero-manager"
+            | "jero-engine"
+            | "jero-kv-cache"
+            | "jero-runner"
+            | "musentinel"
+            | "mu-sentinel"
+            | "muregist"
+            | "mu-regist"
+            | "muobserve"
+            | "muobserve-collector"
+            | "muobservable-collector"
+            | "actionrunner-controller"
+            | "actionrunner-worker"
+            | "actionrunner-rs"
+            | "action-runner-controller"
+            | "action-runner-worker"
+            | "muconde-controller"
+            | "muconde-agent"
+            | "k3-manager"
+            | "k3-engine"
+            | "k3-kv"
+            | "k3-kv-cache"
+            | "k3-server"
+            | "k3-diag"
+            | "model-runner"
+    )
+}
+
 /// Resolves a [`SanAttribution`] directly from a slice of SAN strings.
 pub fn resolve_san_identity_from_list(
     sans: &[String],
@@ -157,7 +200,7 @@ pub fn resolve_san_identity_from_list(
     for san in sans {
         if let Some(rest) = san.strip_prefix("spiffe://") {
             let parts: Vec<&str> = rest.split('/').collect();
-            // e.g. spiffe://cluster.internal/node/worker-riscv64/service/action-runner-worker
+            // e.g. spiffe://cluster.internal/node/worker-riscv64/service/mu-ci-worker
             if parts.len() >= 5 && parts[1] == "node" && parts[3] == "service" {
                 resolved_node = Some(parts[2].to_string());
                 resolved_service = Some(parts[4].to_string());
@@ -175,20 +218,28 @@ pub fn resolve_san_identity_from_list(
             if san.contains("://") {
                 continue;
             }
-            let stripped = if let Some(suffix) = allowed_dns_suffix {
+            if let Some(suffix) = allowed_dns_suffix {
                 let clean_suffix = format!(".{}", suffix.trim_start_matches('.'));
-                san.strip_suffix(&clean_suffix).unwrap_or(san.as_str())
+                let stripped = san.strip_suffix(&clean_suffix).unwrap_or(san.as_str());
+                let labels: Vec<&str> = stripped.split('.').filter(|s| !s.is_empty()).collect();
+                if labels.len() >= 2 {
+                    resolved_service = Some(labels[0].to_string());
+                    resolved_node = Some(labels[1].to_string());
+                    break;
+                } else if labels.len() == 1 && resolved_node.is_none() {
+                    resolved_node = Some(labels[0].to_string());
+                }
             } else {
-                san.split('.').next().unwrap_or(san.as_str())
-            };
-            let labels: Vec<&str> = stripped.split('.').filter(|s| !s.is_empty()).collect();
-            if labels.len() >= 2 {
-                resolved_service = Some(labels[0].to_string());
-                resolved_node = Some(labels[1].to_string());
-                break;
-            } else if labels.len() == 1 {
-                resolved_node = Some(labels[0].to_string());
-                break;
+                let labels: Vec<&str> = san.split('.').filter(|s| !s.is_empty()).collect();
+                if (labels.len() == 2 || labels.len() >= 4)
+                    && is_known_platform_service_name(labels[0])
+                {
+                    resolved_service = Some(labels[0].to_string());
+                    resolved_node = Some(labels[1].to_string());
+                    break;
+                } else if !labels.is_empty() && resolved_node.is_none() {
+                    resolved_node = Some(labels[0].to_string());
+                }
             }
         }
     }
@@ -290,6 +341,7 @@ fn is_node_edge_collector(attr: &SanAttribution) -> bool {
     attr.service_name.as_deref().is_some_and(|svc| {
         svc.eq_ignore_ascii_case("muobserve-collector")
             || svc.eq_ignore_ascii_case("mu-observable-collector")
+            || svc.eq_ignore_ascii_case("muobservable-collector")
     })
 }
 
@@ -1216,5 +1268,153 @@ mod tests {
         let reject_hdr = IpcHeader::new(MSG_TYPE_ARROW_SPANS, reject_payload.len() as u32, 0, 11);
         let res = dispatch_frame(&store, &reject_cfg, &attr, &reject_hdr, &reject_payload);
         assert!(matches!(res, Err(MuObserveError::SanViolation(_))));
+    }
+
+    #[test]
+    fn test_canonical_and_legacy_service_san_recognition() {
+        let canonical_services = [
+            "mu-observable-sentinel",
+            "mu-observable-collector",
+            "mu-observable-hub",
+            "mu-registry",
+            "mu-ci-controller",
+            "mu-ci-worker",
+            "mu-cd-controller",
+            "mu-cd-agent",
+            "jero-manager",
+            "jero-engine",
+            "jero-kv-cache",
+            "jero-runner",
+        ];
+        let legacy_services = [
+            "musentinel",
+            "muregist",
+            "actionrunner-controller",
+            "actionrunner-worker",
+            "action-runner-controller",
+            "action-runner-worker",
+            "muconde-controller",
+            "muconde-agent",
+            "muobserve",
+            "muobserve-collector",
+            "k3-manager",
+            "k3-engine",
+            "model-runner",
+        ];
+
+        for svc in canonical_services.iter().chain(legacy_services.iter()) {
+            assert!(
+                is_known_platform_service_name(svc),
+                "expected '{svc}' to be recognized as platform service"
+            );
+
+            // DNS SAN with explicit allowed_dns_suffix
+            let dns_attr = resolve_san_identity_from_list(
+                &[format!("{svc}.worker-aarch64.cluster.internal")],
+                Some("cluster.internal"),
+            )
+            .expect("resolve dns with suffix");
+            assert_eq!(dns_attr.node_id, "worker-aarch64");
+            assert_eq!(dns_attr.service_name.as_deref(), Some(*svc));
+
+            // DNS SAN without allowed_dns_suffix (still attributes canonical/legacy service + node)
+            let dns_no_suffix = resolve_san_identity_from_list(
+                &[format!("{svc}.worker-aarch64.cluster.internal")],
+                None,
+            )
+            .expect("resolve dns without suffix");
+            assert_eq!(dns_no_suffix.node_id, "worker-aarch64");
+            assert_eq!(dns_no_suffix.service_name.as_deref(), Some(*svc));
+
+            // SPIFFE URI SAN
+            let uri_attr = resolve_san_identity_from_list(
+                &[format!(
+                    "spiffe://cluster.internal/node/worker-riscv64/service/{svc}"
+                )],
+                Some("cluster.internal"),
+            )
+            .expect("resolve spiffe uri");
+            assert_eq!(uri_attr.node_id, "worker-riscv64");
+            assert_eq!(uri_attr.service_name.as_deref(), Some(*svc));
+        }
+
+        // Multi-SAN cert where node SAN precedes service SAN still extracts service_name
+        let multi_attr = resolve_san_identity_from_list(
+            &[
+                "node-a.cluster.internal".to_string(),
+                "mu-cd-controller.node-a.cluster.internal".to_string(),
+            ],
+            Some("cluster.internal"),
+        )
+        .expect("resolve multi-san");
+        assert_eq!(multi_attr.node_id, "node-a");
+        assert_eq!(multi_attr.service_name.as_deref(), Some("mu-cd-controller"));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_canonical_collector_forwards_canonical_platform_services() {
+        use mu_observable_ipc::{encode_log_batch, OtelLogEntry};
+
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        let collector_attr = SanAttribution {
+            raw_sans: vec!["mu-observable-collector.worker-aarch64.cluster.internal".into()],
+            node_id: "worker-aarch64".into(),
+            service_name: Some("mu-observable-collector".into()),
+        };
+        let cfg = IngestServerConfig {
+            san_policy: SanEnforcementPolicy::OverrideWithCertSan,
+            redact_on_ingest: true,
+            allowed_dns_suffix: Some("cluster.internal".into()),
+        };
+
+        let forwarded_services = [
+            "mu-observable-sentinel",
+            "mu-registry",
+            "mu-ci-controller",
+            "mu-ci-worker",
+            "mu-cd-controller",
+            "mu-cd-agent",
+            "jero-manager",
+            "jero-engine",
+            "jero-kv-cache",
+            "jero-runner",
+        ];
+
+        let logs: Vec<OtelLogEntry> = forwarded_services
+            .iter()
+            .enumerate()
+            .map(|(i, svc)| OtelLogEntry {
+                timestamp_unix_nano: 1_700_000_500_000_000_000 + i64::try_from(i).unwrap_or(0),
+                trace_id: format!("tr-canon-{i}"),
+                span_id: format!("sp-canon-{i}"),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: (*svc).into(),
+                node_id: "untrusted-local".into(),
+                body: format!("canonical telemetry from {svc}"),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            })
+            .collect();
+
+        let payload = encode_log_batch(&logs).expect("encode logs");
+        let hdr = IpcHeader::new(MSG_TYPE_ARROW_LOGS, payload.len() as u32, 0, 99);
+        dispatch_frame(&store, &cfg, &collector_attr, &hdr, &payload)
+            .expect("dispatch canonical collector logs");
+
+        let conn = store.lock_conn().expect("lock conn");
+        for (i, svc) in forwarded_services.iter().enumerate() {
+            let (got_svc, got_node): (String, String) = conn
+                .query_row(
+                    "SELECT service_name, node_id FROM v_logs WHERE span_id = ?1",
+                    duckdb::params![format!("sp-canon-{i}")],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("query canonical log");
+            assert_eq!(got_svc, *svc);
+            assert_eq!(got_node, "worker-aarch64");
+        }
     }
 }

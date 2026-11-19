@@ -1,0 +1,24 @@
+[Unit]
+Description=Mu-Observable Hub Cold Parquet Compaction & FIFO Retention Enforcement
+Documentation=https://github.com/LMA1980/mu-observable-hub
+After=network.target
+
+[Service]
+Type=oneshot
+User=mu-observable-hub
+Group=mu-observable-hub
+WorkingDirectory=/var/lib/mu-observable-hub
+EnvironmentFile=-/etc/mu-observable-hub/hub.env
+ExecStart=/usr/local/bin/mu-observable-hub-cli compact --db /var/lib/mu-observable-hub/hot.duckdb --parquet-root /var/lib/mu-observable-hub/parquet
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+ReadWritePaths=/var/lib/mu-observable-hub
+ReadOnlyPaths=/etc/mu-observable-hub
+InaccessiblePaths=/etc/shadow /root /home
