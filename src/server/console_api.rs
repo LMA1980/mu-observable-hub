@@ -289,6 +289,7 @@ fn mount_console_routes(
 /// Builds the console router directly from a preconstructed [`ConsoleApiState`].
 pub fn build_console_api_router_with_state(state: ConsoleApiState) -> Router {
     let mut router = Router::new();
+    router = mount_console_routes(router, &["/health", "/healthz"], get(handle_get_health));
     // Smartscape topology
     router = mount_console_routes(
         router,
@@ -501,6 +502,21 @@ pub fn build_console_api_router_with_state(state: ConsoleApiState) -> Router {
     );
 
     router.fallback(handle_ingress_fallback).with_state(state)
+}
+
+async fn handle_get_health(State(store): State<HotDuckDbStore>) -> Response {
+    match store.count_rows("otel_logs") {
+        Ok(total_logs) => no_store_json(
+            StatusCode::OK,
+            &json!({
+                "status": "ok",
+                "service": "mu-observable-hub",
+                "healthy": true,
+                "total_logs": total_logs
+            }),
+        ),
+        Err(e) => json_error_response(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    }
 }
 
 async fn handle_get_smartscape(
