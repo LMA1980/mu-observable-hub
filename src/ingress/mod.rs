@@ -96,14 +96,6 @@ pub struct IngressUpstreamState {
     pub consecutive_failures: AtomicU32,
 }
 
-/// Reads a trimmed non-empty string from an environment variable.
-pub(crate) fn non_empty_env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 /// Central Ingress Reverse-Proxy Engine.
 pub struct IngressEngine {
     store: HotDuckDbStore,
@@ -116,11 +108,16 @@ pub struct IngressEngine {
 }
 
 impl IngressEngine {
-    /// Creates and initializes a new [`IngressEngine`] using `MUOBSERVE_MCP_HTTP_ADDR`
-    /// (defaulting to `127.0.0.1:9480`) as the local hub listener address for self-proxy guards.
+    /// Creates and initializes a new [`IngressEngine`] using `MU_OBSERVABLE_HUB_MCP_HTTP_ADDR`
+    /// (falling back to `MU_OBSERVABLE_MCP_HTTP_ADDR` / `MUOBSERVE_MCP_HTTP_ADDR`, defaulting to
+    /// `127.0.0.1:9480`) as the local hub listener address for self-proxy guards.
     pub fn new(store: HotDuckDbStore, node_id: String) -> Arc<Self> {
-        let listen_addr =
-            non_empty_env("MUOBSERVE_MCP_HTTP_ADDR").unwrap_or_else(|| "127.0.0.1:9480".into());
+        let listen_addr = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_MCP_HTTP_ADDR",
+            "MU_OBSERVABLE_MCP_HTTP_ADDR",
+            "MUOBSERVE_MCP_HTTP_ADDR",
+        ])
+        .unwrap_or_else(|| "127.0.0.1:9480".into());
         Self::new_with_listen_addr(store, node_id, listen_addr)
     }
 
@@ -153,9 +150,12 @@ impl IngressEngine {
 
     /// Returns the canonical default ingress route definitions.
     pub fn default_routes() -> Vec<(&'static str, &'static str, String, &'static str, bool, bool)> {
-        let ci_base = std::env::var("ACTIONRUNNER_CONTROLLER_URL")
-            .or_else(|_| std::env::var("MUCI_CONTROLLER_URL"))
-            .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string());
+        let ci_base = crate::config::non_empty_env_first(&[
+            "MU_CI_CONTROLLER_URL",
+            "MUCI_CONTROLLER_URL",
+            "ACTIONRUNNER_CONTROLLER_URL",
+        ])
+        .unwrap_or_else(|| "http://127.0.0.1:8000".to_string());
         let ci_upstream = if ci_base.ends_with("/api") || ci_base.ends_with("/api/") {
             if ci_base.ends_with('/') {
                 ci_base
@@ -521,27 +521,55 @@ impl IngressEngine {
                 })
                 .map(str::trim);
 
-            let expected_token = mu_auth::resolve_secret_with_file_var(
-                "MUOBSERVE_BEARER_TOKEN",
-                "MUOBSERVE_BEARER_TOKEN_FILE",
-            )
+            let expected_token = crate::config::resolve_secret_env_pairs(&[
+                (
+                    "MU_OBSERVABLE_HUB_BEARER_TOKEN",
+                    "MU_OBSERVABLE_HUB_BEARER_TOKEN_FILE",
+                ),
+                (
+                    "MU_OBSERVABLE_BEARER_TOKEN",
+                    "MU_OBSERVABLE_BEARER_TOKEN_FILE",
+                ),
+                ("MUOBSERVE_BEARER_TOKEN", "MUOBSERVE_BEARER_TOKEN_FILE"),
+            ])
             .or_else(|| {
-                mu_auth::resolve_secret_with_file_var(
-                    "MUOBSERVE_OPERATOR_TOKEN",
-                    "MUOBSERVE_OPERATOR_TOKEN_FILE",
-                )
+                crate::config::resolve_secret_env_pairs(&[
+                    (
+                        "MU_OBSERVABLE_HUB_OPERATOR_TOKEN",
+                        "MU_OBSERVABLE_HUB_OPERATOR_TOKEN_FILE",
+                    ),
+                    (
+                        "MU_OBSERVABLE_OPERATOR_TOKEN",
+                        "MU_OBSERVABLE_OPERATOR_TOKEN_FILE",
+                    ),
+                    ("MUOBSERVE_OPERATOR_TOKEN", "MUOBSERVE_OPERATOR_TOKEN_FILE"),
+                ])
             })
             .or_else(|| {
-                mu_auth::resolve_secret_with_file_var(
-                    "MUOBSERVE_INGRESS_ADMIN_TOKEN",
-                    "MUOBSERVE_INGRESS_ADMIN_TOKEN_FILE",
-                )
+                crate::config::resolve_secret_env_pairs(&[
+                    (
+                        "MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN",
+                        "MU_OBSERVABLE_HUB_INGRESS_ADMIN_TOKEN_FILE",
+                    ),
+                    (
+                        "MU_OBSERVABLE_INGRESS_ADMIN_TOKEN",
+                        "MU_OBSERVABLE_INGRESS_ADMIN_TOKEN_FILE",
+                    ),
+                    (
+                        "MUOBSERVE_INGRESS_ADMIN_TOKEN",
+                        "MUOBSERVE_INGRESS_ADMIN_TOKEN_FILE",
+                    ),
+                ])
             })
             .or_else(|| {
-                mu_auth::resolve_secret_with_file_var(
-                    "MUCONDE_CD_API_TOKEN",
-                    "MUCONDE_CD_API_TOKEN_FILE",
-                )
+                crate::config::resolve_secret_env_pairs(&[
+                    (
+                        "MU_CD_CONTROLLER_API_TOKEN",
+                        "MU_CD_CONTROLLER_API_TOKEN_FILE",
+                    ),
+                    ("MU_CD_API_TOKEN", "MU_CD_API_TOKEN_FILE"),
+                    ("MUCONDE_CD_API_TOKEN", "MUCONDE_CD_API_TOKEN_FILE"),
+                ])
             });
 
             let bearer_authenticated = match (presented_token, expected_token) {
@@ -552,9 +580,19 @@ impl IngressEngine {
             };
 
             let edge_authenticated = if !bearer_authenticated && auth_header.is_none() {
-                if let Ok(cfg) = mu_auth::EdgeAuthConfig::from_env(
-                    "MUOBSERVE_PROXY_SECRET",
-                    "MUOBSERVE_PROXY_SECRET_FILE",
+                let proxy_secret = crate::config::resolve_secret_env_pairs(&[
+                    (
+                        "MU_OBSERVABLE_HUB_PROXY_SECRET",
+                        "MU_OBSERVABLE_HUB_PROXY_SECRET_FILE",
+                    ),
+                    (
+                        "MU_OBSERVABLE_PROXY_SECRET",
+                        "MU_OBSERVABLE_PROXY_SECRET_FILE",
+                    ),
+                    ("MUOBSERVE_PROXY_SECRET", "MUOBSERVE_PROXY_SECRET_FILE"),
+                ]);
+                if let Ok(cfg) = mu_auth::EdgeAuthConfig::with_secret_and_loopback(
+                    proxy_secret.as_deref(),
                     false,
                 ) {
                     let adapter = mu_auth::GithubEdgeAuthAdapter::new(cfg);
@@ -783,11 +821,14 @@ impl UpstreamHealthChecker {
         } else {
             Duration::from_secs(2)
         };
-        let probe_timeout = std::env::var("MUOBSERVE_UPSTREAM_PROBE_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .unwrap_or(default_timeout);
+        let probe_timeout = crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_UPSTREAM_PROBE_TIMEOUT_MS",
+            "MU_OBSERVABLE_UPSTREAM_PROBE_TIMEOUT_MS",
+            "MUOBSERVE_UPSTREAM_PROBE_TIMEOUT_MS",
+        ])
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default_timeout);
         Self::spawn_with_timeout(engine, interval, probe_timeout)
     }
 
@@ -910,7 +951,20 @@ fn build_ingress_tls_connector() -> Result<tokio_rustls::TlsConnector, String> {
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    if let Ok(ca_path) = std::env::var("MUOBSERVE_CA_CERT") {
+    if let Some(ca_path) = crate::config::non_empty_env_first(&[
+        "MU_OBSERVABLE_HUB_CA_CERT",
+        "MU_OBSERVABLE_HUB_TLS_CA",
+        "MU_OBSERVABLE_CA_CERT",
+        "MUOBSERVE_CA_CERT",
+        "MUOBSERVE_TLS_CA",
+    ])
+    .map(std::path::PathBuf::from)
+    .or_else(|| {
+        crate::config::resolve_existing_path_with_fallback(
+            &[std::path::Path::new(crate::config::CANONICAL_CA_CERT_PATH)],
+            &[std::path::Path::new(crate::config::LEGACY_CA_CERT_PATH)],
+        )
+    }) {
         if let Ok(ca_bytes) = std::fs::read(&ca_path) {
             let mut cursor = std::io::Cursor::new(ca_bytes);
             if let Ok(certs) = rustls::pki_types::CertificateDer::pem_reader_iter(&mut cursor)
@@ -1209,5 +1263,48 @@ mod tests {
         let body = resp_ext.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"proxied-ok");
         let _ = srv_handle.await;
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_ci_controller_url_env_precedence() {
+        use std::sync::Mutex;
+        static CI_URL_LOCK: Mutex<()> = Mutex::new(());
+        let _lock = CI_URL_LOCK.lock().expect("lock");
+        let keys = [
+            "MU_CI_CONTROLLER_URL",
+            "MUCI_CONTROLLER_URL",
+            "ACTIONRUNNER_CONTROLLER_URL",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        // Legacy fallback
+        std::env::set_var("ACTIONRUNNER_CONTROLLER_URL", "http://192.0.2.10:8001");
+        let routes = IngressEngine::default_routes();
+        let ci_route = routes.iter().find(|r| r.0 == "route-ci").unwrap();
+        assert_eq!(ci_route.2, "http://192.0.2.10:8001/api/");
+
+        // Intermediate MUCI_CONTROLLER_URL overrides ACTIONRUNNER_CONTROLLER_URL
+        std::env::set_var("MUCI_CONTROLLER_URL", "http://192.0.2.20:8002/api");
+        let routes = IngressEngine::default_routes();
+        let ci_route = routes.iter().find(|r| r.0 == "route-ci").unwrap();
+        assert_eq!(ci_route.2, "http://192.0.2.20:8002/api/");
+
+        // Canonical MU_CI_CONTROLLER_URL overrides both
+        std::env::set_var("MU_CI_CONTROLLER_URL", "http://192.0.2.30:8003");
+        let routes = IngressEngine::default_routes();
+        let ci_route = routes.iter().find(|r| r.0 == "route-ci").unwrap();
+        assert_eq!(ci_route.2, "http://192.0.2.30:8003/api/");
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

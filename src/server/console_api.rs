@@ -222,7 +222,12 @@ struct MetricsQueryParams {
 /// Builds the read-only observability Axum [`Router`] mounting `/api/v1/*`, `/api/v1/console/*`,
 /// `/api/observe/*`, and `/api/*` endpoints with `Cache-Control: no-store`.
 pub fn build_console_api_router(store: HotDuckDbStore) -> Router {
-    let node_id = std::env::var("MUOBSERVE_NODE_ID").unwrap_or_else(|_| "node-a".to_string());
+    let node_id = crate::config::non_empty_env_first(&[
+        "MU_OBSERVABLE_HUB_NODE_ID",
+        "MU_OBSERVABLE_NODE_ID",
+        "MUOBSERVE_NODE_ID",
+    ])
+    .unwrap_or_else(|| "node-a".to_string());
     let ingress = IngressEngine::new(store.clone(), node_id);
     UpstreamHealthChecker::spawn(ingress.clone(), Duration::from_secs(10));
     build_console_api_router_with_ingress(store, ingress)

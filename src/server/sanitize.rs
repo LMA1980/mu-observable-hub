@@ -130,9 +130,14 @@ fn alias_internal_hostnames_keep_shortname_domains(input: &str) -> String {
 
 fn replace_internal_host_tokens(input: &str) -> String {
     let mut s = input.to_string();
-    let mappings_res =
-        std::env::var("MUOBSERVE_HOSTNAME_ALIASES").or_else(|_| std::env::var("MUCONDE_NODE_MAP"));
-    if let Ok(mappings) = mappings_res {
+    let mappings_opt = crate::config::non_empty_env_first(&[
+        "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+        "MU_OBSERVABLE_HOSTNAME_ALIASES",
+        "MUOBSERVE_HOSTNAME_ALIASES",
+        "MU_CD_CONTROLLER_NODE_MAP",
+        "MUCONDE_NODE_MAP",
+    ]);
+    if let Some(mappings) = mappings_opt {
         for pair in mappings.split(',') {
             if let Some((k, v)) = pair.split_once(':').or_else(|| pair.split_once('=')) {
                 let k_trim = k.trim();
@@ -675,7 +680,11 @@ mod tests {
         format!("{}.{}.100.55", 192, 168)
     }
 
+    static ALIAS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn init_test_aliases() {
+        std::env::remove_var("MU_OBSERVABLE_HUB_HOSTNAME_ALIASES");
+        std::env::remove_var("MU_OBSERVABLE_HOSTNAME_ALIASES");
         std::env::set_var(
             "MUOBSERVE_HOSTNAME_ALIASES",
             "test-host-alpha:node-a,test-host-beta:node-b,test-worker-riscv:worker-riscv64",
@@ -684,6 +693,7 @@ mod tests {
 
     #[test]
     fn test_stage1_hostname_and_domain_aliasing() {
+        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
         init_test_aliases();
         let p = TEST_HOST_P;
         let e = TEST_HOST_E;
@@ -750,6 +760,7 @@ mod tests {
             "file .../src/main.rs:42"
         );
 
+        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
         init_test_aliases();
         let redactor = PrivacyRedactor::new();
         let e = TEST_HOST_E;
@@ -775,6 +786,7 @@ mod tests {
 
     #[test]
     fn test_property_zero_leakage_across_arbitrary_corpus_and_json_dtos() {
+        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
         init_test_aliases();
         let redactor = PrivacyRedactor::new();
         let p = TEST_HOST_P;
@@ -866,5 +878,41 @@ mod tests {
         assert_eq!(dto["host.name"], "worker-riscv64");
         assert_eq!(dto["authorization"], "[REDACTED]");
         assert_eq!(dto["nested"]["api_key"], "[REDACTED]");
+    }
+
+    #[test]
+    fn test_canonical_hub_hostname_aliases_env_precedence() {
+        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
+        let keys = [
+            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+            "MU_OBSERVABLE_HOSTNAME_ALIASES",
+            "MUOBSERVE_HOSTNAME_ALIASES",
+            "MU_CD_CONTROLLER_NODE_MAP",
+            "MUCONDE_NODE_MAP",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        std::env::set_var("MUOBSERVE_HOSTNAME_ALIASES", "internal-host-1:legacy-node");
+        assert_eq!(alias_internal_hostnames("internal-host-1"), "legacy-node");
+
+        std::env::set_var(
+            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+            "internal-host-1:canonical-node",
+        );
+        assert_eq!(
+            alias_internal_hostnames("internal-host-1"),
+            "canonical-node"
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 }

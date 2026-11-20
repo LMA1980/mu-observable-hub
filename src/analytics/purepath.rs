@@ -704,11 +704,17 @@ fn classify_trace_domain(service: &str, operation: &str, attrs_json: &str) -> St
     let lower_attrs = attrs_json.to_ascii_lowercase();
 
     if lower_svc.contains("action-runner")
+        || lower_svc.contains("actionrunner")
+        || lower_svc.contains("mu-ci")
+        || lower_svc.contains("muci")
         || lower_op.starts_with("ci.")
         || lower_op.starts_with("stage.")
     {
         "ci".to_string()
     } else if lower_svc.contains("muconde")
+        || lower_svc.contains("mu-conde")
+        || lower_svc.contains("mu-cd")
+        || lower_svc.contains("mucd")
         || lower_op.contains("deploy")
         || lower_op.contains("canary")
         || lower_op.contains("rollout")

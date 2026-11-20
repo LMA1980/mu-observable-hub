@@ -10,26 +10,26 @@ depends-on = ["mu-ci-isolation"]
 source.cargo = "mu-ci-isolation"
 
 [[installations]]
-name = "mu-observable-cli"
-executable = "mu-observable-cli"
+name = "mu-observable-hub-cli"
+executable = "mu-observable-hub-cli"
 
 [subcommand.mu-observable-hub]
 description = "Query mu-observable-hub benchmark regressions, canary SLOs, W3C traces, and guarded DuckDB analytics"
 audience = "agents"
-command = "mu-observable-cli"
-predicates = ["path_exists(mu-observable-cli)"]
+command = "mu-observable-hub-cli"
+predicates = ["path_exists(mu-observable-hub-cli)"]
 
 [[mcp_servers]]
 name = "mu-observable-hub"
-command = "/usr/local/bin/mu-observable-mcp"
+command = "/usr/local/bin/mu-observable-hub-mcp"
 args = [
     "--db",
-    "/var/lib/muobserve/db/muobserve.duckdb",
+    "/var/lib/mu-observable-hub/hot.duckdb",
     "--parquet-root",
-    "/var/lib/muobserve/parquet",
+    "/var/lib/mu-observable-hub/parquet",
 ]
 env = [
-    { name = "MUOBSERVE_DB_PATH", value = "/var/lib/muobserve/db/muobserve.duckdb" },
-    { name = "MUOBSERVE_PARQUET_ROOT", value = "/var/lib/muobserve/parquet" },
+    { name = "MU_OBSERVABLE_HUB_DB_PATH", value = "/var/lib/mu-observable-hub/hot.duckdb" },
+    { name = "MU_OBSERVABLE_HUB_PARQUET_ROOT", value = "/var/lib/mu-observable-hub/parquet" },
 ]
-predicates = ["path_exists(/usr/local/bin/mu-observable-mcp)"]
+predicates = ["path_exists(/usr/local/bin/mu-observable-hub-mcp)"]

@@ -10,10 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::analytics::{evaluate_canary_slo, evaluate_regression_gate};
+use crate::config::{non_empty_env_first, resolve_parquet_root};
 use crate::error::MuObserveError;
 use crate::mcp::McpServer;
 use crate::sql_guard::{execute_guarded_sql, DEFAULT_SQL_MAX_ROWS, DEFAULT_SQL_TIMEOUT_MS};
 use crate::storage::hot_duckdb::HotDuckDbStore;
+use crate::storage::parquet_compactor::{CompactorConfig, ParquetCompactor};
+use crate::DEFAULT_HOT_RETENTION_DAYS;
 
 /// Report returned by `migrate-actionrunner --from <path>` summarizing imported rows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,11 +26,18 @@ pub struct ActionRunnerMigrationReport {
     pub submodule_snapshots_imported: u32,
 }
 
-/// Structured CLI subcommands supported by `muobserve-cli`.
+/// Structured CLI subcommands supported by `mu-observable-hub-cli` (and `muobserve-cli`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CliCommand {
     MigrateActionRunner {
         from_path: PathBuf,
+    },
+    Compact {
+        parquet_root: Option<PathBuf>,
+        hot_retention_days: u32,
+        raw_telemetry_ttl_days: u32,
+        max_store_bytes: Option<u64>,
+        min_free_disk_bytes: Option<u64>,
     },
     Regressions {
         repo_key: String,
@@ -196,49 +206,113 @@ fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, MuObserveEr
 /// where the first element is an optional `--db <path>` override.
 pub fn parse_cli_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand), MuObserveError> {
     let mut db_path: Option<PathBuf> = None;
+    let mut pre_parquet_root: Option<PathBuf> = None;
     let mut idx = 0;
 
-    while idx < args.len() && args[idx] == "--db" {
+    while idx < args.len() && matches!(args[idx].as_str(), "--db" | "--parquet-root") {
+        let flag = args[idx].as_str();
         let Some(p) = args.get(idx + 1) else {
-            return Err(MuObserveError::Validation(
-                "Missing path argument after --db".into(),
-            ));
+            return Err(MuObserveError::Validation(format!(
+                "Missing path argument after {flag}"
+            )));
         };
-        db_path = Some(PathBuf::from(p));
+        if flag == "--db" {
+            db_path = Some(PathBuf::from(p));
+        } else {
+            pre_parquet_root = Some(PathBuf::from(p));
+        }
         idx += 2;
     }
 
     let Some(subcmd) = args.get(idx).map(String::as_str) else {
         return Err(MuObserveError::Validation(
-            "Expected subcommand: migrate-actionrunner | regressions | traces | slo | sql".into(),
+            "Expected subcommand: migrate-actionrunner | compact | regressions | traces | slo | sql"
+                .into(),
         ));
     };
-    let rest = &args[idx + 1..];
+    let extracted = extract_global_flags(&args[idx + 1..])?;
+    if db_path.is_none() {
+        db_path = extracted.db_path;
+    }
+    let parquet_root_override = extracted.parquet_root.or(pre_parquet_root);
+    let rest = extracted.rest;
 
     let cmd = match subcmd {
         "migrate-actionrunner" => {
-            let from = find_flag_value(rest, "--from").ok_or_else(|| {
+            let from = find_flag_value(&rest, "--from").ok_or_else(|| {
                 MuObserveError::Validation("migrate-actionrunner requires --from <path>".into())
             })?;
             CliCommand::MigrateActionRunner {
                 from_path: PathBuf::from(from),
             }
         }
+        "compact" => {
+            let hot_retention_days = find_flag_value(&rest, "--hot-retention-days")
+                .and_then(|s| s.parse::<u32>().ok())
+                .or_else(|| {
+                    non_empty_env_first(&[
+                        "MU_OBSERVABLE_HUB_HOT_RETENTION_DAYS",
+                        "MU_OBSERVABLE_HOT_RETENTION_DAYS",
+                        "MUOBSERVE_HOT_RETENTION_DAYS",
+                    ])
+                    .and_then(|s| s.parse::<u32>().ok())
+                })
+                .unwrap_or(DEFAULT_HOT_RETENTION_DAYS);
+            let raw_telemetry_ttl_days = find_flag_value(&rest, "--raw-telemetry-ttl-days")
+                .or_else(|| find_flag_value(&rest, "--ttl-days"))
+                .and_then(|s| s.parse::<u32>().ok())
+                .or_else(|| {
+                    non_empty_env_first(&[
+                        "MU_OBSERVABLE_HUB_RAW_TELEMETRY_TTL_DAYS",
+                        "MU_OBSERVABLE_RAW_TELEMETRY_TTL_DAYS",
+                        "MUOBSERVE_RAW_TELEMETRY_TTL_DAYS",
+                    ])
+                    .and_then(|s| s.parse::<u32>().ok())
+                })
+                .unwrap_or(60);
+            let max_store_bytes = find_flag_value(&rest, "--max-store-bytes")
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    non_empty_env_first(&[
+                        "MU_OBSERVABLE_HUB_MAX_STORE_BYTES",
+                        "MU_OBSERVABLE_MAX_STORE_BYTES",
+                        "MUOBSERVE_MAX_STORE_BYTES",
+                    ])
+                    .and_then(|s| s.parse::<u64>().ok())
+                });
+            let min_free_disk_bytes = find_flag_value(&rest, "--min-free-disk-bytes")
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| {
+                    non_empty_env_first(&[
+                        "MU_OBSERVABLE_HUB_MIN_FREE_DISK_BYTES",
+                        "MU_OBSERVABLE_MIN_FREE_DISK_BYTES",
+                        "MUOBSERVE_MIN_FREE_DISK_BYTES",
+                    ])
+                    .and_then(|s| s.parse::<u64>().ok())
+                });
+            CliCommand::Compact {
+                parquet_root: parquet_root_override,
+                hot_retention_days,
+                raw_telemetry_ttl_days,
+                max_store_bytes,
+                min_free_disk_bytes,
+            }
+        }
         "regressions" => {
-            let repo_key = find_flag_value(rest, "--repo").ok_or_else(|| {
+            let repo_key = find_flag_value(&rest, "--repo").ok_or_else(|| {
                 MuObserveError::Validation("regressions requires --repo <repo_key>".into())
             })?;
-            let candidate_commit = find_flag_value(rest, "--commit").ok_or_else(|| {
+            let candidate_commit = find_flag_value(&rest, "--commit").ok_or_else(|| {
                 MuObserveError::Validation(
                     "regressions requires --commit <candidate_commit>".into(),
                 )
             })?;
             let baseline_branch =
-                find_flag_value(rest, "--baseline").unwrap_or_else(|| "main".into());
-            let max_slowdown_pct = find_flag_value(rest, "--max-slowdown-pct")
+                find_flag_value(&rest, "--baseline").unwrap_or_else(|| "main".into());
+            let max_slowdown_pct = find_flag_value(&rest, "--max-slowdown-pct")
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(5.0);
-            let max_flakiness_pct = find_flag_value(rest, "--max-flakiness-pct")
+            let max_flakiness_pct = find_flag_value(&rest, "--max-flakiness-pct")
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(2.0);
             CliCommand::Regressions {
@@ -250,7 +324,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand), 
             }
         }
         "traces" => {
-            let trace_id = find_flag_value(rest, "--trace-id")
+            let trace_id = find_flag_value(&rest, "--trace-id")
                 .or_else(|| rest.first().cloned())
                 .ok_or_else(|| {
                     MuObserveError::Validation("traces requires --trace-id <trace_id>".into())
@@ -258,19 +332,19 @@ pub fn parse_cli_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand), 
             CliCommand::Traces { trace_id }
         }
         "slo" => {
-            let service_name = find_flag_value(rest, "--service").ok_or_else(|| {
+            let service_name = find_flag_value(&rest, "--service").ok_or_else(|| {
                 MuObserveError::Validation("slo requires --service <service_name>".into())
             })?;
             let candidate_digest =
-                find_flag_value(rest, "--digest").unwrap_or_else(|| "HEAD".into());
-            let node_id = find_flag_value(rest, "--node").unwrap_or_default();
-            let bake_window_secs = find_flag_value(rest, "--window-secs")
+                find_flag_value(&rest, "--digest").unwrap_or_else(|| "HEAD".into());
+            let node_id = find_flag_value(&rest, "--node").unwrap_or_default();
+            let bake_window_secs = find_flag_value(&rest, "--window-secs")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(300);
-            let max_error_logs = find_flag_value(rest, "--max-errors")
+            let max_error_logs = find_flag_value(&rest, "--max-errors")
                 .and_then(|s| s.parse::<u32>().ok())
                 .unwrap_or(0);
-            let max_p99_latency_ms = find_flag_value(rest, "--max-p99-ms")
+            let max_p99_latency_ms = find_flag_value(&rest, "--max-p99-ms")
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(250.0);
             CliCommand::Slo {
@@ -283,12 +357,12 @@ pub fn parse_cli_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand), 
             }
         }
         "sql" => {
-            let query = find_flag_value(rest, "--query")
+            let query = find_flag_value(&rest, "--query")
                 .or_else(|| rest.first().cloned())
                 .ok_or_else(|| {
                     MuObserveError::Validation("sql requires --query <SELECT ...>".into())
                 })?;
-            let max_rows = find_flag_value(rest, "--max-rows")
+            let max_rows = find_flag_value(&rest, "--max-rows")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SQL_MAX_ROWS);
             CliCommand::Sql { query, max_rows }
@@ -301,6 +375,74 @@ pub fn parse_cli_args(args: &[String]) -> Result<(Option<PathBuf>, CliCommand), 
     };
 
     Ok((db_path, cmd))
+}
+
+struct ExtractedGlobalFlags {
+    db_path: Option<PathBuf>,
+    parquet_root: Option<PathBuf>,
+    rest: Vec<String>,
+}
+
+fn extract_global_flags(args: &[String]) -> Result<ExtractedGlobalFlags, MuObserveError> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--from",
+        "--repo",
+        "--commit",
+        "--baseline",
+        "--max-slowdown-pct",
+        "--max-flakiness-pct",
+        "--trace-id",
+        "--service",
+        "--digest",
+        "--node",
+        "--window-secs",
+        "--max-errors",
+        "--max-p99-ms",
+        "--query",
+        "--max-rows",
+        "--hot-retention-days",
+        "--raw-telemetry-ttl-days",
+        "--ttl-days",
+        "--max-store-bytes",
+        "--min-free-disk-bytes",
+    ];
+    let mut db_path: Option<PathBuf> = None;
+    let mut parquet_root: Option<PathBuf> = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if matches!(arg, "--db" | "--parquet-root") {
+            let Some(val) = args.get(i + 1) else {
+                return Err(MuObserveError::Validation(format!(
+                    "Missing path argument after {arg}"
+                )));
+            };
+            if arg == "--db" {
+                db_path = Some(PathBuf::from(val));
+            } else {
+                parquet_root = Some(PathBuf::from(val));
+            }
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        if VALUE_FLAGS.contains(&arg) {
+            if let Some(val) = args.get(i + 1) {
+                rest.push(val.clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    Ok(ExtractedGlobalFlags {
+        db_path,
+        parquet_root,
+        rest,
+    })
 }
 
 fn find_flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -320,6 +462,39 @@ pub fn execute_cli_command(
     match cmd {
         CliCommand::MigrateActionRunner { from_path } => {
             let report = migrate_actionrunner_duckdb(store, from_path)?;
+            Ok(serde_json::to_value(report)?)
+        }
+        CliCommand::Compact {
+            parquet_root,
+            hot_retention_days,
+            raw_telemetry_ttl_days,
+            max_store_bytes,
+            min_free_disk_bytes,
+        } => {
+            let resolved_root = parquet_root
+                .clone()
+                .or_else(|| store.parquet_root().map(Path::to_path_buf))
+                .or_else(|| resolve_parquet_root(None, store.db_path(), false))
+                .ok_or_else(|| {
+                    MuObserveError::Validation(
+                        "compact requires --parquet-root <path> or configured parquet root".into(),
+                    )
+                })?;
+            let mut cfg = CompactorConfig::new(resolved_root)
+                .with_hot_retention_days(*hot_retention_days)
+                .with_raw_telemetry_ttl_days(*raw_telemetry_ttl_days);
+            if let Some(max_bytes) = max_store_bytes {
+                cfg = cfg.with_max_store_bytes(*max_bytes);
+            }
+            if let Some(min_free) = min_free_disk_bytes {
+                cfg = cfg.with_min_free_disk_bytes(*min_free);
+            }
+            let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_else(|| {
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_mul(1_000_000)
+            });
+            let report = ParquetCompactor::new(cfg).compact_at_now(store, now_ns)?;
             Ok(serde_json::to_value(report)?)
         }
         CliCommand::Regressions {
@@ -523,5 +698,65 @@ mod tests {
         .unwrap();
         let sql_res = execute_cli_command(&target_store, &sql_cmd).unwrap();
         assert_eq!(sql_res["row_count"], 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_compact_cli_subcommand_and_post_subcommand_flags() {
+        use crate::storage::parquet_compactor::CompactionReport;
+        use mu_observable_ipc::OtelLogEntry;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("hot.duckdb");
+        let parquet_root = dir.path().join("parquet");
+
+        let (parsed_db, parsed_cmd) = parse_cli_args(&[
+            "compact".into(),
+            "--db".into(),
+            db_path.to_string_lossy().into_owned(),
+            "--parquet-root".into(),
+            parquet_root.to_string_lossy().into_owned(),
+        ])
+        .expect("parse compact post-subcommand flags");
+        assert_eq!(parsed_db.as_deref(), Some(db_path.as_path()));
+        assert!(matches!(
+            parsed_cmd,
+            CliCommand::Compact {
+                parquet_root: Some(ref pr),
+                hot_retention_days: 7,
+                raw_telemetry_ttl_days: 60,
+                ..
+            } if pr == &parquet_root
+        ));
+
+        let store = HotDuckDbStore::open(Some(&db_path), Some(&parquet_root)).expect("open duckdb");
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_else(|| {
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_mul(1_000_000)
+        });
+        let aged_within_ttl_ts = now_ns - (10 * 86_400 * 1_000_000_000i64);
+        store
+            .insert_logs(&[OtelLogEntry {
+                timestamp_unix_nano: aged_within_ttl_ts,
+                trace_id: "tr-compact-1".into(),
+                span_id: "sp-compact-1".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-observable-hub".into(),
+                node_id: "node-a".into(),
+                body: "aged compaction line".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            }])
+            .expect("insert aged log");
+
+        let out = execute_cli_command(&store, &parsed_cmd).expect("execute compact");
+        let report: CompactionReport = serde_json::from_value(out).expect("parse CompactionReport");
+        assert_eq!(report.exported_logs, 1);
+        assert_eq!(report.ttl_pruned_files, 0);
+        assert_eq!(store.count_rows("otel_logs").unwrap(), 0);
+        assert_eq!(store.count_rows("v_logs").unwrap(), 1);
     }
 }

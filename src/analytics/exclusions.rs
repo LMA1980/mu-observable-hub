@@ -208,13 +208,26 @@ impl MonitoringExclusions {
         }
     }
 
-    /// Loads exclusions configured via environment variables (`MUOBSERVE_EXCLUDED_REPOS`,
-    /// `MUOBSERVE_RETIRED_SERVICES`, `MUOBSERVE_MONITORING_SINCE_UNIX_NANO`).
+    /// Loads exclusions configured via environment variables (`MU_OBSERVABLE_HUB_EXCLUDED_REPOS` /
+    /// `MUOBSERVE_EXCLUDED_REPOS`, `MU_OBSERVABLE_HUB_RETIRED_SERVICES` / `MUOBSERVE_RETIRED_SERVICES`,
+    /// `MU_OBSERVABLE_HUB_MONITORING_SINCE_UNIX_NANO` / `MUOBSERVE_MONITORING_SINCE_UNIX_NANO`).
     #[must_use]
     pub fn from_env() -> Self {
-        let repos = std::env::var(ENV_EXCLUDED_REPOS).ok();
-        let services = std::env::var(ENV_RETIRED_SERVICES).ok();
-        let since = std::env::var(ENV_MONITORING_SINCE_UNIX_NANO).ok();
+        let repos = crate::config::env_var_first(&[
+            "MU_OBSERVABLE_HUB_EXCLUDED_REPOS",
+            "MU_OBSERVABLE_EXCLUDED_REPOS",
+            ENV_EXCLUDED_REPOS,
+        ]);
+        let services = crate::config::env_var_first(&[
+            "MU_OBSERVABLE_HUB_RETIRED_SERVICES",
+            "MU_OBSERVABLE_RETIRED_SERVICES",
+            ENV_RETIRED_SERVICES,
+        ]);
+        let since = crate::config::env_var_first(&[
+            "MU_OBSERVABLE_HUB_MONITORING_SINCE_UNIX_NANO",
+            "MU_OBSERVABLE_MONITORING_SINCE_UNIX_NANO",
+            ENV_MONITORING_SINCE_UNIX_NANO,
+        ]);
         Self::parse_from_env_values(repos.as_deref(), services.as_deref(), since.as_deref())
     }
 

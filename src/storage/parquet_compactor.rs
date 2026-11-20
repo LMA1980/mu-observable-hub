@@ -333,14 +333,18 @@ impl ParquetCompactor {
 }
 
 fn resolve_cold_tier() -> &'static str {
-    let has_s3 = std::env::var("MUOBSERVE_S3_ENDPOINT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .is_some()
-        || std::env::var("MUOBSERVE_S3_BUCKET")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .is_some();
+    let has_s3 = crate::config::non_empty_env_first(&[
+        "MU_OBSERVABLE_HUB_S3_ENDPOINT",
+        "MU_OBSERVABLE_S3_ENDPOINT",
+        "MUOBSERVE_S3_ENDPOINT",
+    ])
+    .is_some()
+        || crate::config::non_empty_env_first(&[
+            "MU_OBSERVABLE_HUB_S3_BUCKET",
+            "MU_OBSERVABLE_S3_BUCKET",
+            "MUOBSERVE_S3_BUCKET",
+        ])
+        .is_some();
     if has_s3 {
         "cold_s3"
     } else {
