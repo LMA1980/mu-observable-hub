@@ -140,14 +140,14 @@ fn tokenize_text_into(
 
 /// Extracts normalized lowercase tokens (`len >= 2`, preserving comparison operators
 /// `<`, `>`, `=`, and splitting on non-alphanumeric characters except `_`, `-`, `.`, `/`, `<`,
-/// `>`, `=`, up to 32 unique tokens per line) from `line_body`, `service_name`, `node_id`,
-/// `job_id`, and `stage_id`.
+/// `>`, `=`, up to 32 unique tokens per line), indexing structured metadata (`service_name`,
+/// `node_id`, `job_id`, and `stage_id`) before `line_body` so long log lines never evict
+/// service or host identifiers.
 #[must_use]
 pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
     let mut seen = HashSet::with_capacity(MAX_TOKENS_PER_LINE);
     let mut out = Vec::with_capacity(MAX_TOKENS_PER_LINE);
 
-    tokenize_text_into(line_body, &mut seen, &mut out, Some(MAX_TOKENS_PER_LINE));
     tokenize_text_into(
         &entry.service_name,
         &mut seen,
@@ -166,6 +166,7 @@ pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
     if let Some(sid) = entry.stage_id.as_deref() {
         tokenize_text_into(sid, &mut seen, &mut out, Some(MAX_TOKENS_PER_LINE));
     }
+    tokenize_text_into(line_body, &mut seen, &mut out, Some(MAX_TOKENS_PER_LINE));
 
     // Also index comparator-led suffixes (`<=5`, `>=100`, `=5`) and sub-words (`status`, `failed`)
     // for compound tokens such as `count<=5` or `status=failed`.
@@ -205,6 +206,52 @@ fn tokenize_query_text(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     tokenize_text_into(query, &mut seen, &mut out, None);
+    out
+}
+
+/// Expands a query token into canonical platform service aliases when it matches a known
+/// service group (after stripping an optional `svc:` prefix and `-`, `_`, ` ` separators),
+/// always preserving the original `tok` and deduplicating results.
+fn expand_service_query_aliases(tok: &str) -> Vec<String> {
+    let mut out = vec![tok.to_owned()];
+    let lower = tok.to_ascii_lowercase();
+    let stripped = lower.strip_prefix("svc:").unwrap_or(&lower);
+    let compact: String = stripped
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | ' '))
+        .collect();
+
+    let aliases: &[&str] = match compact.as_str() {
+        "muregist" | "muregistry" | "muregistdaemon" | "muregistrydaemon" => {
+            &["muregist", "mu-registry", "muregistry", "muregist-daemon"]
+        }
+        "muconsole" | "actionrunnerweb" => &["mu-console", "muconsole", "actionrunner-web"],
+        "muobserve" | "muobservable" | "muobservehub" | "muobservablehub" => &[
+            "muobserve",
+            "mu-observable",
+            "mu-observable-hub",
+            "muobserve-hub",
+        ],
+        "muobservecollector" | "muobservablecollector" => {
+            &["muobserve-collector", "mu-observable-collector"]
+        }
+        "mucondecontroller" | "mucdcontroller" => &["muconde-controller", "mu-cd-controller"],
+        "mucondeagent" | "mucdagent" => &["muconde-agent", "mu-cd-agent"],
+        "actionrunnercontroller" | "mucicontroller" => {
+            &["actionrunner-controller", "mu-ci-controller"]
+        }
+        "actionrunnerrs" | "actionrunnerworker" | "muciworker" => {
+            &["actionrunner-rs", "actionrunner-worker", "mu-ci-worker"]
+        }
+        "muisolation" | "muciisolation" => &["muisolation", "mu-isolation", "mu-ci-isolation"],
+        _ => &[],
+    };
+
+    for &alias in aliases {
+        if !out.iter().any(|existing| existing == alias) {
+            out.push(alias.to_owned());
+        }
+    }
     out
 }
 
@@ -911,16 +958,35 @@ impl HotDuckDbStore {
         }
 
         let mut candidate_hashes: Option<HashSet<u64>> = None;
-        let mut idx_stmt = conn.prepare(
-            r#"
-            SELECT DISTINCT dedup_hash
-            FROM log_inverted_index
-            WHERE token = ?1
-              AND (?2 IS NULL OR job_id = ?2)
-            "#,
-        )?;
         for tok in &query_tokens {
-            let rows = idx_stmt.query_map(params![tok, job_id], |r| r.get::<_, u64>(0))?;
+            let aliases = expand_service_query_aliases(tok);
+            let k = aliases.len();
+            let token_placeholders = (2..=1 + k)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let svc_placeholders = (2 + k..=1 + 2 * k)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                r#"
+                SELECT DISTINCT dedup_hash
+                FROM log_inverted_index
+                WHERE (token IN ({token_placeholders}) OR LOWER(service_name) IN ({svc_placeholders}))
+                  AND (?1 IS NULL OR job_id = ?1)
+                "#
+            );
+            let mut param_refs: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(1 + 2 * k);
+            param_refs.push(&job_id);
+            for alias in &aliases {
+                param_refs.push(alias);
+            }
+            for alias in &aliases {
+                param_refs.push(alias);
+            }
+            let mut idx_stmt = conn.prepare(&sql)?;
+            let rows = idx_stmt.query_map(&param_refs[..], |r| r.get::<_, u64>(0))?;
             let mut set = HashSet::new();
             for h in rows {
                 set.insert(h?);
@@ -3186,5 +3252,194 @@ mod tests {
         assert_eq!(entries[3].severity_number, 17);
 
         assert!(entries.iter().all(|e| e.service_name != "actionrunner-rs"));
+    }
+
+    #[test]
+    fn test_tokenize_log_line_retains_metadata_and_service_aliases_expand() {
+        let long_body = (0..45)
+            .map(|i| format!("tokenword{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let entry = OtelLogEntry {
+            timestamp_unix_nano: 1_700_000_030_000_000_000,
+            trace_id: "tr-meta-1".into(),
+            span_id: "sp-meta-1".into(),
+            severity_number: 9,
+            severity_text: "INFO".into(),
+            service_name: "muregist".into(),
+            node_id: "node-a".into(),
+            body: long_body.clone(),
+            attributes_json: r#"{"line_no":1,"stream":1}"#.into(),
+            job_id: Some("job-meta-42".into()),
+            stage_id: Some("stage-publish".into()),
+        };
+
+        let tokens = tokenize_log_line(&entry, &long_body);
+        assert_eq!(tokens.len(), MAX_TOKENS_PER_LINE);
+        assert!(tokens.contains(&"muregist".to_string()));
+        assert!(tokens.contains(&"node-a".to_string()));
+        assert!(tokens.contains(&"job-meta-42".to_string()));
+        assert!(tokens.contains(&"stage-publish".to_string()));
+
+        let muregist_aliases = expand_service_query_aliases("muregist");
+        assert!(muregist_aliases.contains(&"muregist".to_string()));
+        assert!(muregist_aliases.contains(&"mu-registry".to_string()));
+        assert_eq!(
+            muregist_aliases.iter().collect::<HashSet<_>>().len(),
+            muregist_aliases.len()
+        );
+
+        let mu_registry_aliases = expand_service_query_aliases("mu-registry");
+        assert!(mu_registry_aliases.contains(&"muregist".to_string()));
+        assert!(mu_registry_aliases.contains(&"mu-registry".to_string()));
+
+        let svc_prefixed = expand_service_query_aliases("svc:Mu-Registry");
+        assert_eq!(
+            svc_prefixed.first().map(String::as_str),
+            Some("svc:Mu-Registry")
+        );
+        assert!(svc_prefixed.contains(&"muregist".to_string()));
+        assert!(svc_prefixed.contains(&"mu-registry".to_string()));
+
+        assert!(expand_service_query_aliases("muconsole").contains(&"actionrunner-web".to_string()));
+        assert!(
+            expand_service_query_aliases("muobserve").contains(&"mu-observable-hub".to_string())
+        );
+        assert!(expand_service_query_aliases("muobserve-collector")
+            .contains(&"mu-observable-collector".to_string()));
+        assert!(expand_service_query_aliases("muconde-controller")
+            .contains(&"mu-cd-controller".to_string()));
+        assert!(expand_service_query_aliases("muconde-agent").contains(&"mu-cd-agent".to_string()));
+        assert!(expand_service_query_aliases("actionrunner-controller")
+            .contains(&"mu-ci-controller".to_string()));
+        assert!(
+            expand_service_query_aliases("actionrunner-rs").contains(&"mu-ci-worker".to_string())
+        );
+        assert!(
+            expand_service_query_aliases("muisolation").contains(&"mu-ci-isolation".to_string())
+        );
+        assert_eq!(
+            expand_service_query_aliases("timeout"),
+            vec!["timeout".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_search_logs_by_token_service_aliases_and_historical_rows() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let base_ts = 1_700_000_040_000_000_000i64;
+        let body_45_words = (0..45)
+            .map(|i| format!("bodyword{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let entries = vec![
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts + 1_000_000,
+                trace_id: "tr-muregist-long".into(),
+                span_id: "sp-1".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "muregist".into(),
+                node_id: "worker-riscv64".into(),
+                body: body_45_words,
+                attributes_json: r#"{"line_no":1,"stream":1}"#.into(),
+                job_id: Some("job-reg-1".into()),
+                stage_id: Some("stage-reg".into()),
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts + 2_000_000,
+                trace_id: "tr-mu-registry-timeout".into(),
+                span_id: "sp-2".into(),
+                severity_number: 17,
+                severity_text: "ERROR".into(),
+                service_name: "mu-registry".into(),
+                node_id: "node-a".into(),
+                body: "upstream timeout waiting for crate index".into(),
+                attributes_json: r#"{"line_no":2,"stream":2}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts + 3_000_000,
+                trace_id: "tr-console-other".into(),
+                span_id: "sp-3".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-console".into(),
+                node_id: "node-a".into(),
+                body: "rendered dashboard snapshot".into(),
+                attributes_json: r#"{"line_no":3,"stream":1}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts + 4_000_000,
+                trace_id: "tr-muregist-historical".into(),
+                span_id: "sp-4".into(),
+                severity_number: 13,
+                severity_text: "WARN".into(),
+                service_name: "muregist".into(),
+                node_id: "node-a".into(),
+                body: "historical sparse index refresh".into(),
+                attributes_json: r#"{"line_no":4,"stream":1}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ];
+
+        store.insert_logs(&entries).expect("insert alias test logs");
+
+        // Simulate a historical row where the `service_name` token was omitted by the old 32-token cap.
+        {
+            let conn = store.lock_conn().expect("lock conn");
+            let deleted = conn
+                .execute(
+                    "DELETE FROM log_inverted_index WHERE token = 'muregist' AND dedup_hash IN (SELECT dedup_hash FROM otel_logs WHERE trace_id = 'tr-muregist-historical')",
+                    [],
+                )
+                .expect("delete muregist token for historical simulation");
+            assert_eq!(deleted, 1);
+        }
+
+        // 1 & 3: Both `muregist` and `mu-registry` match the 45-word muregist row,
+        // the `mu-registry` row, and the historical row, while excluding `mu-console`.
+        for query in ["muregist", "mu-registry"] {
+            let hits = store
+                .search_logs_by_token(query, None, 10)
+                .expect("search service alias");
+            let trace_ids: HashSet<String> = hits.iter().map(|h| h.trace_id.clone()).collect();
+            assert!(
+                trace_ids.contains("tr-muregist-long"),
+                "query '{query}' must return long-body muregist row: {trace_ids:?}"
+            );
+            assert!(
+                trace_ids.contains("tr-mu-registry-timeout"),
+                "query '{query}' must return mu-registry row: {trace_ids:?}"
+            );
+            assert!(
+                trace_ids.contains("tr-muregist-historical"),
+                "query '{query}' must return simulated historical row: {trace_ids:?}"
+            );
+            assert!(
+                !trace_ids.contains("tr-console-other"),
+                "query '{query}' must exclude unrelated mu-console row: {trace_ids:?}"
+            );
+        }
+
+        // 2: Multi-token intersection (`"muregist timeout"`) matches only the `mu-registry` timeout log.
+        let multi_hits = store
+            .search_logs_by_token("muregist timeout", None, 10)
+            .expect("search multi-token alias intersection");
+        assert_eq!(multi_hits.len(), 1);
+        assert_eq!(multi_hits[0].trace_id, "tr-mu-registry-timeout");
+
+        // Job-scoped query respects `?1 IS NULL OR job_id = ?1`.
+        let job_hits = store
+            .search_logs_by_token("mu-registry", Some("job-reg-1"), 10)
+            .expect("search alias scoped to job_id");
+        assert_eq!(job_hits.len(), 1);
+        assert_eq!(job_hits[0].trace_id, "tr-muregist-long");
     }
 }
