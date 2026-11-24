@@ -42,7 +42,9 @@ async fn test_end_to_end_mtls_stream_arrow_and_fory_pipeline() {
         allowed_dns_suffix: Some("cluster.internal".into()),
     };
 
-    let now_ts = 1_700_000_500_000_000_000i64;
+    let now_ts = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .expect("current UTC timestamp fits in i64 nanoseconds");
 
     // 1. Stream Arrow logs over async duplex via handle_single_frame_on_stream
     let logs = vec![OtelLogEntry {
@@ -314,7 +316,11 @@ async fn test_end_to_end_mtls_stream_arrow_and_fory_pipeline() {
     )
     .unwrap();
     match decode_control_envelope(&slo_resp).unwrap() {
-        ControlRpcEnvelope::CanarySloResp(r) => assert!(r.healthy),
+        ControlRpcEnvelope::CanarySloResp(r) => {
+            assert!(r.healthy, "unexpected SLO breach: {}", r.reason);
+            assert_eq!(r.error_log_count, 0);
+            assert!((r.p99_latency_ms - 5.0).abs() < 1e-6);
+        }
         other => panic!("unexpected: {other:?}"),
     }
 
@@ -440,4 +446,154 @@ fn test_tls_config_and_san_dns_resolution() {
     let attr = resolve_san_identity(cert.der(), Some("cluster.internal")).expect("resolve dns san");
     assert_eq!(attr.node_id, "node-a");
     assert_eq!(attr.service_name, None);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_canary_slo_rpc_anchors_to_wallclock_ignoring_stale_errors() {
+    let dir = tempdir().expect("tempdir");
+    let db_path = dir.path().join("hot.duckdb");
+    let parquet_root = dir.path().join("parquet");
+    let store =
+        HotDuckDbStore::open(Some(&db_path), Some(&parquet_root)).expect("open HotDuckDbStore");
+
+    let attr = SanAttribution {
+        raw_sans: vec!["node-a.cluster.internal".into()],
+        node_id: "node-a".into(),
+        service_name: Some("mu-cd-controller".into()),
+    };
+    let config = IngestServerConfig {
+        san_policy: SanEnforcementPolicy::OverrideWithCertSan,
+        redact_on_ingest: true,
+        allowed_dns_suffix: Some("cluster.internal".into()),
+    };
+
+    let now_ns = chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .expect("current UTC timestamp fits in i64 nanoseconds");
+    let two_hours_ago_ns = now_ns - 2 * 3600 * 1_000_000_000;
+
+    // Ingest a stale 2-hour-old ERROR log and stale slow ERROR span with zero recent telemetry.
+    let stale_logs = vec![OtelLogEntry {
+        timestamp_unix_nano: two_hours_ago_ns,
+        trace_id: "trace-stale-err".into(),
+        span_id: "span-stale-err".into(),
+        severity_number: 17,
+        severity_text: "ERROR".into(),
+        service_name: "mu-cd-controller".into(),
+        node_id: "node-a".into(),
+        body: "transient git fetch error from two hours ago".into(),
+        attributes_json: "{}".into(),
+        job_id: None,
+        stage_id: None,
+    }];
+    let stale_log_bytes = encode_log_batch(&stale_logs).unwrap();
+    dispatch_frame(
+        &store,
+        &config,
+        &attr,
+        &IpcHeader::new(MSG_TYPE_ARROW_LOGS, stale_log_bytes.len() as u32, 0, 1),
+        &stale_log_bytes,
+    )
+    .unwrap();
+
+    let stale_spans = vec![OtelSpanEntry {
+        trace_id: "trace-stale-err".into(),
+        span_id: "span-stale-err".into(),
+        parent_span_id: None,
+        service_name: "mu-cd-controller".into(),
+        node_id: "node-a".into(),
+        span_name: "cd.policy.refresh".into(),
+        span_kind: "INTERNAL".into(),
+        start_time_unix_nano: two_hours_ago_ns - 500_000_000,
+        end_time_unix_nano: two_hours_ago_ns,
+        duration_ns: 500_000_000,
+        status_code: "ERROR".into(),
+        status_message: Some("stale timeout".into()),
+        attributes_json: "{}".into(),
+    }];
+    let stale_span_bytes = encode_span_batch(&stale_spans).unwrap();
+    dispatch_frame(
+        &store,
+        &config,
+        &attr,
+        &IpcHeader::new(MSG_TYPE_ARROW_SPANS, stale_span_bytes.len() as u32, 0, 2),
+        &stale_span_bytes,
+    )
+    .unwrap();
+
+    // Live CanarySloReq over RPC MUST anchor to current wall-clock UTC, ignoring 2h-old telemetry.
+    let slo_req = CanarySloAssertionRequest {
+        request_id: "slo-stale-check".into(),
+        service_name: "mu-cd-controller".into(),
+        candidate_digest: "sha256:candidate".into(),
+        node_id: "node-a".into(),
+        bake_window_secs: 60,
+        max_error_logs: 0,
+        max_p99_latency_ms: 100.0,
+    };
+    let slo_bytes =
+        encode_control_envelope(&ControlRpcEnvelope::CanarySloReq(slo_req.clone())).unwrap();
+    let (_, slo_resp) = dispatch_frame(
+        &store,
+        &config,
+        &attr,
+        &IpcHeader::new(MSG_TYPE_FORY_CONTROL, slo_bytes.len() as u32, 0, 3),
+        &slo_bytes,
+    )
+    .unwrap();
+    match decode_control_envelope(&slo_resp).unwrap() {
+        ControlRpcEnvelope::CanarySloResp(r) => {
+            assert!(
+                r.healthy,
+                "stale 2h-old error must not trip live canary SLO: {}",
+                r.reason
+            );
+            assert_eq!(r.error_log_count, 0);
+            assert!(!r.taint_recommended);
+            assert_eq!(r.p99_latency_ms, 0.0);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // A fresh ERROR log inside the active 60s bake window MUST still fail the SLO.
+    let fresh_logs = vec![OtelLogEntry {
+        timestamp_unix_nano: now_ns - 5 * 1_000_000_000,
+        trace_id: "trace-fresh-err".into(),
+        span_id: "span-fresh-err".into(),
+        severity_number: 17,
+        severity_text: "ERROR".into(),
+        service_name: "mu-cd-controller".into(),
+        node_id: "node-a".into(),
+        body: "live canary request failed".into(),
+        attributes_json: "{}".into(),
+        job_id: None,
+        stage_id: None,
+    }];
+    let fresh_log_bytes = encode_log_batch(&fresh_logs).unwrap();
+    dispatch_frame(
+        &store,
+        &config,
+        &attr,
+        &IpcHeader::new(MSG_TYPE_ARROW_LOGS, fresh_log_bytes.len() as u32, 0, 4),
+        &fresh_log_bytes,
+    )
+    .unwrap();
+
+    let (_, breach_resp) = dispatch_frame(
+        &store,
+        &config,
+        &attr,
+        &IpcHeader::new(MSG_TYPE_FORY_CONTROL, slo_bytes.len() as u32, 0, 5),
+        &slo_bytes,
+    )
+    .unwrap();
+    match decode_control_envelope(&breach_resp).unwrap() {
+        ControlRpcEnvelope::CanarySloResp(r) => {
+            assert!(!r.healthy);
+            assert!(r.taint_recommended);
+            assert_eq!(r.error_log_count, 1);
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
 }
