@@ -630,7 +630,8 @@ fn dispatch_control_rpc(
             Ok(ControlRpcEnvelope::RegressionGateResp(report))
         }
         ControlRpcEnvelope::CanarySloReq(req) => {
-            let resp = evaluate_canary_slo(store, &req, None)?;
+            let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let resp = evaluate_canary_slo(store, &req, Some(now_ns))?;
             Ok(ControlRpcEnvelope::CanarySloResp(resp))
         }
         other => Err(MuObserveError::Validation(format!(
