@@ -38,7 +38,10 @@ use crate::server::subsystem_status::{
     PlatformSubsystemId, SubsystemMaintenanceRequest, SubsystemStatusChangedEvent,
     SubsystemStatusRegistry,
 };
-use crate::storage::hot_duckdb::HotDuckDbStore;
+use crate::storage::hot_duckdb::{
+    append_log_cursor_clause, build_log_token_search_clause, format_log_cursor, map_v_logs_row,
+    parse_log_cursor, push_cursor_params, tokenize_query_text, HotDuckDbStore, LogPageCursor,
+};
 use crate::DEFAULT_HOT_RETENTION_DAYS;
 
 /// Shared Axum router state backing observability, ingress, subsystem status, and authorization gates.
@@ -96,6 +99,8 @@ pub struct ConsoleLogItem {
     pub line_no: u32,
     #[serde(default)]
     pub stream: u8,
+    #[serde(default)]
+    pub dedup_hash: u64,
 }
 
 /// Alias for [`ConsoleLogItem`] used by token search and line-indexed log queries.
@@ -107,6 +112,12 @@ pub struct LogsQueryResponse {
     pub severity: String,
     pub total: usize,
     pub logs: Vec<ConsoleLogItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_matched: Option<u64>,
 }
 
 /// Single metric timeseries sample with optional W3C exemplar linkage (`M6.4`, `#44`, `#46`).
@@ -208,6 +219,7 @@ struct LogsQueryParams {
     limit: Option<usize>,
     from: Option<i64>,
     to: Option<i64>,
+    before: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1339,20 +1351,20 @@ struct FacetSqlFilter<'a> {
     min_sev: Option<i32>,
     max_sev: Option<i32>,
     sev_text: Option<&'a str>,
-    hashes: Option<&'a [u64]>,
+    token_query: Option<&'a str>,
 }
 
 impl<'a> FacetSqlFilter<'a> {
-    fn where_clause(&self, hash_param_start: usize) -> String {
-        match self.hashes {
-            Some(hv) => {
-                let placeholders = (hash_param_start..hash_param_start + hv.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{LOG_FACET_BASE_WHERE} AND dedup_hash IN ({placeholders})")
+    fn where_clause_and_token_params(&self, param_start: usize) -> Option<(String, Vec<String>)> {
+        let mut next_idx = param_start;
+        let mut token_params = Vec::new();
+        match self.token_query {
+            Some(tq) => {
+                let clause =
+                    build_log_token_search_clause(tq, 4, &mut next_idx, &mut token_params)?;
+                Some((format!("{LOG_FACET_BASE_WHERE} AND {clause}"), token_params))
             }
-            None => LOG_FACET_BASE_WHERE.to_string(),
+            None => Some((LOG_FACET_BASE_WHERE.to_string(), token_params)),
         }
     }
 
@@ -1366,14 +1378,6 @@ impl<'a> FacetSqlFilter<'a> {
         out.push(&self.max_sev);
         out.push(&self.sev_text);
     }
-
-    fn push_hash_params<'b>(&'b self, out: &mut Vec<&'b dyn duckdb::types::ToSql>) {
-        if let Some(hv) = self.hashes {
-            for h in hv {
-                out.push(h);
-            }
-        }
-    }
 }
 
 fn query_log_facets_data(
@@ -1383,11 +1387,20 @@ fn query_log_facets_data(
     step_ns: i64,
     redactor: &PrivacyRedactor,
 ) -> LogFacetsResponse {
-    let base_where = filter.where_clause(9);
+    let Some((base_where, base_token_params)) = filter.where_clause_and_token_params(9) else {
+        return LogFacetsResponse {
+            total_count: 0,
+            services: Vec::new(),
+            levels: Vec::new(),
+            histogram: Vec::new(),
+        };
+    };
     let mut base_params: Vec<&dyn duckdb::types::ToSql> =
-        Vec::with_capacity(8 + filter.hashes.map_or(0, |h| h.len()));
+        Vec::with_capacity(8 + base_token_params.len());
     filter.push_base_params(&mut base_params);
-    filter.push_hash_params(&mut base_params);
+    for s in &base_token_params {
+        base_params.push(s);
+    }
 
     // Query 1: total_count
     let count_sql = format!("SELECT COUNT(*) FROM v_logs WHERE {base_where}");
@@ -1437,7 +1450,14 @@ fn query_log_facets_data(
 
     // Query 4: histogram
     let step_ms_i64 = step_ms as i64;
-    let hist_where = filter.where_clause(11);
+    let Some((hist_where, hist_token_params)) = filter.where_clause_and_token_params(11) else {
+        return LogFacetsResponse {
+            total_count: 0,
+            services: Vec::new(),
+            levels: Vec::new(),
+            histogram: Vec::new(),
+        };
+    };
     let hist_sql = format!(
         r#"
         SELECT
@@ -1454,11 +1474,13 @@ fn query_log_facets_data(
         "#
     );
     let mut hist_params: Vec<&dyn duckdb::types::ToSql> =
-        Vec::with_capacity(10 + filter.hashes.map_or(0, |h| h.len()));
+        Vec::with_capacity(10 + hist_token_params.len());
     filter.push_base_params(&mut hist_params);
     hist_params.push(&step_ns);
     hist_params.push(&step_ms_i64);
-    filter.push_hash_params(&mut hist_params);
+    for s in &hist_token_params {
+        hist_params.push(s);
+    }
 
     let mut histogram = Vec::new();
     if let Ok(mut stmt) = conn.prepare(&hist_sql) {
@@ -1560,39 +1582,25 @@ async fn handle_get_log_facets(
         Err(e) => return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
 
-    let token_query = params.token.as_deref().or(params.q.as_deref());
-    let candidate_hashes = if let Some(tq) = token_query.map(str::trim).filter(|s| !s.is_empty()) {
-        match HotDuckDbStore::candidate_hashes_for_query_conn(&conn, tq, params.job_id.as_deref()) {
-            Ok(None) => {
-                return no_store_json(
-                    StatusCode::OK,
-                    &LogFacetsResponse {
-                        total_count: 0,
-                        services: Vec::new(),
-                        levels: Vec::new(),
-                        histogram: Vec::new(),
-                    },
-                );
-            }
-            Ok(Some(hashes)) if hashes.is_empty() => {
-                return no_store_json(
-                    StatusCode::OK,
-                    &LogFacetsResponse {
-                        total_count: 0,
-                        services: Vec::new(),
-                        levels: Vec::new(),
-                        histogram: Vec::new(),
-                    },
-                );
-            }
-            Ok(Some(hashes)) => Some(hashes),
-            Err(e) => {
-                return json_error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-            }
+    let token_query = params
+        .token
+        .as_deref()
+        .or(params.q.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(tq) = token_query {
+        if tokenize_query_text(tq).is_empty() {
+            return no_store_json(
+                StatusCode::OK,
+                &LogFacetsResponse {
+                    total_count: 0,
+                    services: Vec::new(),
+                    levels: Vec::new(),
+                    histogram: Vec::new(),
+                },
+            );
         }
-    } else {
-        None
-    };
+    }
 
     let step_ms = params.step_ms.unwrap_or(60_000).clamp(1_000, 86_400_000);
     let step_ns = (step_ms as i64) * 1_000_000;
@@ -1611,7 +1619,6 @@ async fn handle_get_log_facets(
     };
 
     let redactor = PrivacyRedactor::new();
-    let hashes_vec: Option<Vec<u64>> = candidate_hashes.map(|set| set.into_iter().collect());
     let filter = FacetSqlFilter {
         from_ns,
         to_ns,
@@ -1621,7 +1628,7 @@ async fn handle_get_log_facets(
         min_sev,
         max_sev,
         sev_text,
-        hashes: hashes_vec.as_deref(),
+        token_query,
     };
     let resp = query_log_facets_data(&conn, &filter, step_ms, step_ns, &redactor);
 
@@ -1766,23 +1773,31 @@ async fn handle_get_logs(
         }
     }
 
-    let max_limit = if params.job_id.is_some() { 500 } else { 100 };
+    let max_limit = 500;
     let limit = match params.limit {
         Some(0) => {
-            return json_error_response(StatusCode::BAD_REQUEST, "limit must be between 1 and 100")
+            return json_error_response(StatusCode::BAD_REQUEST, "limit must be between 1 and 500")
         }
         Some(l) if l > max_limit => {
-            return json_error_response(StatusCode::BAD_REQUEST, "limit must be between 1 and 100")
+            return json_error_response(StatusCode::BAD_REQUEST, "limit must be between 1 and 500")
         }
         Some(l) => l,
         None if params.job_id.is_some() => 200,
         None => 50,
     };
 
+    let before_cursor = match params.before.as_deref() {
+        Some(raw) => match parse_log_cursor(raw) {
+            Ok(c) => Some(c),
+            Err(msg) => return json_error_response(StatusCode::BAD_REQUEST, msg),
+        },
+        None => None,
+    };
+
     let from_ns = params.from.map(|f| f.max(0).saturating_mul(1_000_000));
     let to_ns = params.to.map(|t| t.max(0).saturating_mul(1_000_000));
 
-    match query_sanitized_logs_with_token_and_bounds(
+    match query_sanitized_logs_paginated(
         &store,
         &sev_norm,
         min_sev_range,
@@ -1792,6 +1807,7 @@ async fn handle_get_logs(
         token_query,
         from_ns,
         to_ns,
+        before_cursor,
         limit,
     ) {
         Ok(resp) => no_store_json(StatusCode::OK, &resp),
@@ -1915,41 +1931,82 @@ pub fn query_sanitized_logs_with_token_and_bounds(
     to_ns: Option<i64>,
     limit: usize,
 ) -> Result<LogsQueryResponse, MuObserveError> {
-    let redactor = PrivacyRedactor::new();
-    let max_cap = if job_id_filter.is_some() { 500 } else { 100 };
-    let bounded_limit = limit.clamp(1, max_cap);
+    query_sanitized_logs_paginated(
+        store,
+        severity_label,
+        sev_range,
+        service_filter,
+        trace_id_filter,
+        job_id_filter,
+        token_query,
+        from_ns,
+        to_ns,
+        None,
+        limit,
+    )
+}
 
-    let mut logs = if let Some(tq) = token_query.map(str::trim).filter(|s| !s.is_empty()) {
-        store.search_logs_by_token_filtered(
-            tq,
-            sev_range,
-            service_filter,
-            trace_id_filter,
-            job_id_filter,
-            from_ns,
-            to_ns,
-            bounded_limit,
-        )?
-    } else {
-        query_v_logs_rows(
-            store,
-            &redactor,
-            sev_range,
-            service_filter,
-            trace_id_filter,
-            job_id_filter,
-            from_ns,
-            to_ns,
-            bounded_limit,
-        )?
-    };
+/// Queries `v_logs` with optional keyset cursor pagination (`before`), applying the 3-stage
+/// [`PrivacyRedactor`] and returning `(logs, next_cursor, has_more, total_matched)`.
+#[allow(clippy::too_many_arguments)]
+pub fn query_sanitized_logs_paginated(
+    store: &HotDuckDbStore,
+    severity_label: &str,
+    sev_range: Option<(i32, i32, &str)>,
+    service_filter: Option<&str>,
+    trace_id_filter: Option<&str>,
+    job_id_filter: Option<&str>,
+    token_query: Option<&str>,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    before: Option<LogPageCursor>,
+    limit: usize,
+) -> Result<LogsQueryResponse, MuObserveError> {
+    let redactor = PrivacyRedactor::new();
+    let bounded_limit = limit.clamp(1, 500);
+
+    let (mut logs, has_more, total_matched) =
+        if let Some(tq) = token_query.map(str::trim).filter(|s| !s.is_empty()) {
+            store.search_logs_by_token_paginated(
+                tq,
+                sev_range,
+                service_filter,
+                trace_id_filter,
+                job_id_filter,
+                from_ns,
+                to_ns,
+                before,
+                bounded_limit,
+            )?
+        } else {
+            query_v_logs_rows(
+                store,
+                &redactor,
+                sev_range,
+                service_filter,
+                trace_id_filter,
+                job_id_filter,
+                from_ns,
+                to_ns,
+                before,
+                bounded_limit,
+            )?
+        };
 
     logs.sort_by(|a, b| {
         b.timestamp_unix_nano
             .cmp(&a.timestamp_unix_nano)
             .then_with(|| b.line_no.cmp(&a.line_no))
+            .then_with(|| b.dedup_hash.cmp(&a.dedup_hash))
     });
     logs.truncate(bounded_limit);
+
+    let next_cursor = if has_more {
+        logs.last()
+            .map(|last| format_log_cursor(last.timestamp_unix_nano, last.line_no, last.dedup_hash))
+    } else {
+        None
+    };
 
     Ok(LogsQueryResponse {
         severity: if severity_label.is_empty() {
@@ -1959,6 +2016,9 @@ pub fn query_sanitized_logs_with_token_and_bounds(
         },
         total: logs.len(),
         logs,
+        next_cursor,
+        has_more,
+        total_matched: Some(total_matched),
     })
 }
 
@@ -1972,101 +2032,85 @@ fn query_v_logs_rows(
     job_id_filter: Option<&str>,
     from_ns: Option<i64>,
     to_ns: Option<i64>,
+    before: Option<LogPageCursor>,
     bounded_limit: usize,
-) -> Result<Vec<ConsoleLogItem>, MuObserveError> {
+) -> Result<(Vec<ConsoleLogItem>, bool, u64), MuObserveError> {
     let conn = store.lock_conn()?;
     let (min_sev, max_sev, sev_text) = match sev_range {
         Some((min_n, max_n, txt)) => (Some(min_n), Some(max_n), Some(txt)),
         None => (None, None, None),
     };
 
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT
-            timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
-            service_name, node_id, body, attributes_json, job_id, stage_id,
-            COALESCE(line_no, 0), COALESCE(stream, 1)
-        FROM v_logs
-        WHERE (?1 IS NULL OR trace_id = ?1)
+    let base_where = r#"
+        (?1 IS NULL OR trace_id = ?1)
           AND (?2 IS NULL OR job_id = ?2)
           AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL') OR (?5 = 'WARN' AND UPPER(severity_text) = 'WARNING') OR (?5 = 'DEBUG' AND UPPER(severity_text) = 'TRACE'))
           AND (?6 IS NULL OR LOWER(service_name) = LOWER(?6))
           AND (?7 IS NULL OR timestamp_unix_nano >= ?7)
           AND (?8 IS NULL OR timestamp_unix_nano <= ?8)
-        ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC
-        LIMIT 500
-        "#,
-    )?;
+    "#;
 
-    let rows = stmt.query_map(
-        params![
-            trace_id_filter,
-            job_id_filter,
-            min_sev,
-            max_sev,
-            sev_text,
-            service_filter,
-            from_ns,
-            to_ns,
-        ],
-        |r| {
-            let ts_ns: i64 = r.get(0)?;
-            let raw_svc: String = r.get(5)?;
-            let raw_node: String = r.get(6)?;
-            let raw_body: String = r.get(7)?;
-            let raw_attrs: String = r.get(8)?;
-            let line_no_u32: u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
-            let stream_u8: u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
-            let clean_svc = redactor.redact_str(&raw_svc);
-            Ok(ConsoleLogItem {
-                timestamp_unix_nano: ts_ns,
-                timestamp_ms: ts_ns / 1_000_000,
-                trace_id: r.get(1)?,
-                span_id: r.get(2)?,
-                severity_number: r.get(3)?,
-                severity_text: r.get(4)?,
-                service: clean_svc.clone(),
-                service_name: clean_svc,
-                node_id: redactor.redact_host(&raw_node),
-                body: redactor.redact_str(&raw_body),
-                attributes: redactor.redact_attributes_json(&raw_attrs),
-                job_id: r.get(9)?,
-                stage_id: r.get(10)?,
-                line_no: line_no_u32,
-                stream: stream_u8,
-            })
-        },
-    )?;
+    let count_sql = format!("SELECT COUNT(*) FROM v_logs WHERE {base_where}");
+    let total_matched: u64 = conn
+        .query_row(
+            &count_sql,
+            params![
+                trace_id_filter,
+                job_id_filter,
+                min_sev,
+                max_sev,
+                sev_text,
+                service_filter,
+                from_ns,
+                to_ns,
+            ],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|c| c.max(0) as u64)?;
 
-    let mut logs = Vec::new();
+    let mut next_param_idx = 9usize;
+    let (cursor_clause, cursor_vals) = append_log_cursor_clause(before, &mut next_param_idx);
+    let lim_idx = next_param_idx;
+    let lim = (bounded_limit + 1) as i64;
+
+    let rows_sql = format!(
+        r#"
+        SELECT
+            timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
+            service_name, node_id, body, attributes_json, job_id, stage_id,
+            COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
+        FROM v_logs
+        WHERE {base_where}
+          {cursor_clause}
+        ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC, COALESCE(dedup_hash, 0) DESC
+        LIMIT ?{lim_idx}
+        "#
+    );
+
+    let mut param_refs: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(12);
+    param_refs.push(&trace_id_filter);
+    param_refs.push(&job_id_filter);
+    param_refs.push(&min_sev);
+    param_refs.push(&max_sev);
+    param_refs.push(&sev_text);
+    param_refs.push(&service_filter);
+    param_refs.push(&from_ns);
+    param_refs.push(&to_ns);
+    push_cursor_params(&cursor_vals, &mut param_refs);
+    param_refs.push(&lim);
+
+    let mut stmt = conn.prepare(&rows_sql)?;
+    let rows = stmt.query_map(&param_refs[..], |r| map_v_logs_row(r, redactor))?;
+
+    let mut logs = Vec::with_capacity(bounded_limit + 1);
     for r in rows {
-        let item = r?;
-        if !matches_severity(&item, sev_range) {
-            continue;
-        }
-        if let Some(svc) = service_filter {
-            if !item.service.eq_ignore_ascii_case(svc) {
-                continue;
-            }
-        }
-        logs.push(item);
-        if logs.len() >= bounded_limit {
-            break;
-        }
+        logs.push(r?);
     }
-    Ok(logs)
-}
-
-fn matches_severity(item: &ConsoleLogItem, sev_range: Option<(i32, i32, &str)>) -> bool {
-    let Some((min_n, max_n, txt)) = sev_range else {
-        return true;
-    };
-    let num_matches = item.severity_number >= min_n && item.severity_number <= max_n;
-    let text_matches = item.severity_text.eq_ignore_ascii_case(txt)
-        || (txt == "ERROR" && item.severity_text.eq_ignore_ascii_case("FATAL"))
-        || (txt == "WARN" && item.severity_text.eq_ignore_ascii_case("WARNING"))
-        || (txt == "DEBUG" && item.severity_text.eq_ignore_ascii_case("TRACE"));
-    num_matches || text_matches
+    let has_more = logs.len() > bounded_limit;
+    if has_more {
+        logs.truncate(bounded_limit);
+    }
+    Ok((logs, has_more, total_matched))
 }
 
 /// Retrieves and 3-stage sanitizes the full execution log for `job_id` reconstructed line-by-line
@@ -2672,5 +2716,171 @@ mod tests {
             )
             .expect("count mu-ingress spans");
         assert_eq!(ingress_span_count, 0);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_logs_keyset_cursor_pagination_identical_timestamps_and_search() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use mu_observable_ipc::OtelLogEntry;
+        use std::collections::HashSet;
+        use tower::ServiceExt;
+
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        let base_ts = 1_700_000_100_000_000_000i64;
+        let mut entries = Vec::with_capacity(650);
+        for i in 0..650usize {
+            // Burst groups of 10 logs share identical timestamps to test composite keyset tie-breaking
+            let ts = base_ts + ((i / 10) as i64) * 1_000_000;
+            entries.push(OtelLogEntry {
+                timestamp_unix_nano: ts,
+                trace_id: format!("tr-page-{i:04}"),
+                span_id: format!("sp-page-{i:04}"),
+                severity_number: if i % 20 == 0 { 17 } else { 9 },
+                severity_text: if i % 20 == 0 { "ERROR" } else { "INFO" }.into(),
+                service_name: "mu-registry".into(),
+                node_id: "node-a".into(),
+                body: format!("burst_item index={i:04}"),
+                attributes_json: format!(r#"{{"line_no":{},"stream":1}}"#, (i % 10) + 1),
+                job_id: Some(format!("job-grp-{}", i / 10)),
+                stage_id: None,
+            });
+        }
+        store.insert_logs(&entries).expect("insert 650 logs");
+        let app = build_console_api_router(store);
+
+        // 1. Page through all 650 logs using limit=200 and before=<next_cursor>
+        let mut cursor: Option<String> = None;
+        let mut collected_traces = HashSet::new();
+        let mut page_sizes = Vec::new();
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!("/api/v1/logs?limit=200&before={c}"),
+                None => "/api/v1/logs?limit=200".to_string(),
+            };
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let parsed: LogsQueryResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed.total, parsed.logs.len());
+            assert_eq!(parsed.total_matched, Some(650));
+            page_sizes.push(parsed.logs.len());
+            for item in &parsed.logs {
+                assert!(
+                    collected_traces.insert(item.trace_id.clone()),
+                    "duplicate trace across cursor pages: {}",
+                    item.trace_id
+                );
+            }
+            if !parsed.has_more {
+                assert!(parsed.next_cursor.is_none());
+                break;
+            }
+            cursor = parsed.next_cursor;
+            assert!(cursor.is_some());
+        }
+        assert_eq!(page_sizes, vec![200, 200, 200, 50]);
+        assert_eq!(collected_traces.len(), 650);
+
+        // 2. limit=500 works, limit=501 and malformed before cursors return 400
+        let resp_500 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/logs?limit=500")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_500.status(), StatusCode::OK);
+
+        for bad_uri in [
+            "/api/v1/logs?limit=501",
+            "/api/v1/logs?before=invalid-cursor",
+            "/api/v1/logs?before=",
+        ] {
+            let bad_resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(bad_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                bad_resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{bad_uri} must return 400"
+            );
+        }
+
+        // 3. Paginated substring search across >500 matches + facets consistency
+        let search_p1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/logs?q=burst&limit=400")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search_p1.status(), StatusCode::OK);
+        let p1_bytes = search_p1.into_body().collect().await.unwrap().to_bytes();
+        let p1: LogsQueryResponse = serde_json::from_slice(&p1_bytes).unwrap();
+        assert_eq!(p1.logs.len(), 400);
+        assert!(p1.has_more);
+        assert_eq!(p1.total_matched, Some(650));
+
+        let c1 = p1.next_cursor.expect("search page 1 next_cursor");
+        let search_p2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/v1/logs?q=burst&limit=400&before={c1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search_p2.status(), StatusCode::OK);
+        let p2_bytes = search_p2.into_body().collect().await.unwrap().to_bytes();
+        let p2: LogsQueryResponse = serde_json::from_slice(&p2_bytes).unwrap();
+        assert_eq!(p2.logs.len(), 250);
+        assert!(!p2.has_more);
+
+        let facets_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/logs/facets?q=burst")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(facets_resp.status(), StatusCode::OK);
+        let facets_bytes = facets_resp.into_body().collect().await.unwrap().to_bytes();
+        let facets: LogFacetsResponse = serde_json::from_slice(&facets_bytes).unwrap();
+        assert_eq!(facets.total_count, 650);
     }
 }

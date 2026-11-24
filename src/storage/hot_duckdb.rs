@@ -202,11 +202,226 @@ pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
     out
 }
 
-fn tokenize_query_text(query: &str) -> Vec<String> {
+pub(crate) fn tokenize_query_text(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     tokenize_text_into(query, &mut seen, &mut out, None);
     out
+}
+
+/// Keyset pagination cursor for `GET /api/v1/logs` (`before=<ts_ns>` or
+/// `before=<ts_ns>:<line_no>:<dedup_hash>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPageCursor {
+    pub timestamp_unix_nano: i64,
+    pub line_no: Option<u32>,
+    pub dedup_hash: Option<u64>,
+}
+
+/// Parses a keyset log pagination cursor (`"<ts_ns>"` or `"<ts_ns>:<line_no>:<dedup_hash>"`).
+///
+/// # Errors
+/// Returns a descriptive static error string when empty, non-numeric, or malformed.
+pub fn parse_log_cursor(raw: &str) -> Result<LogPageCursor, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("before cursor cannot be empty");
+    }
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    match parts.as_slice() {
+        [ts_str] => {
+            if ts_str.is_empty() || !ts_str.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(
+                    "Invalid before cursor; expected '<ts_ns>' or '<ts_ns>:<line_no>:<dedup_hash>'",
+                );
+            }
+            let ts = ts_str
+                .parse::<i64>()
+                .map_err(|_| "Invalid before cursor timestamp")?;
+            Ok(LogPageCursor {
+                timestamp_unix_nano: ts,
+                line_no: None,
+                dedup_hash: None,
+            })
+        }
+        [ts_str, line_str, hash_str] => {
+            if ts_str.is_empty()
+                || line_str.is_empty()
+                || hash_str.is_empty()
+                || !ts_str.bytes().all(|b| b.is_ascii_digit())
+                || !line_str.bytes().all(|b| b.is_ascii_digit())
+                || !hash_str.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(
+                    "Invalid before cursor; expected '<ts_ns>' or '<ts_ns>:<line_no>:<dedup_hash>'",
+                );
+            }
+            let ts = ts_str
+                .parse::<i64>()
+                .map_err(|_| "Invalid before cursor timestamp")?;
+            let line_no = line_str
+                .parse::<u32>()
+                .map_err(|_| "Invalid before cursor line_no")?;
+            let dedup_hash = hash_str
+                .parse::<u64>()
+                .map_err(|_| "Invalid before cursor dedup_hash")?;
+            Ok(LogPageCursor {
+                timestamp_unix_nano: ts,
+                line_no: Some(line_no),
+                dedup_hash: Some(dedup_hash),
+            })
+        }
+        _ => Err("Invalid before cursor; expected '<ts_ns>' or '<ts_ns>:<line_no>:<dedup_hash>'"),
+    }
+}
+
+/// Formats a deterministic composite keyset cursor (`"<ts_ns>:<line_no>:<dedup_hash>"`).
+#[must_use]
+pub fn format_log_cursor(ts_ns: i64, line_no: u32, dedup_hash: u64) -> String {
+    format!("{ts_ns}:{line_no}:{dedup_hash}")
+}
+
+pub(crate) struct BoundLogCursorParams {
+    ts_ns: i64,
+    tie: Option<(i64, u64)>,
+}
+
+pub(crate) fn append_log_cursor_clause(
+    cursor: Option<LogPageCursor>,
+    next_param_idx: &mut usize,
+) -> (String, Option<BoundLogCursorParams>) {
+    let Some(c) = cursor else {
+        return (String::new(), None);
+    };
+    let ts_idx = *next_param_idx;
+    *next_param_idx += 1;
+    if let (Some(line_no), Some(dedup_hash)) = (c.line_no, c.dedup_hash) {
+        let ln_idx = *next_param_idx;
+        let dh_idx = *next_param_idx + 1;
+        *next_param_idx += 2;
+        let clause = format!(
+            " AND (timestamp_unix_nano < ?{ts_idx} \
+             OR (timestamp_unix_nano = ?{ts_idx} AND COALESCE(line_no, 0) < ?{ln_idx}) \
+             OR (timestamp_unix_nano = ?{ts_idx} AND COALESCE(line_no, 0) = ?{ln_idx} AND COALESCE(dedup_hash, 0) < ?{dh_idx}))"
+        );
+        (
+            clause,
+            Some(BoundLogCursorParams {
+                ts_ns: c.timestamp_unix_nano,
+                tie: Some((i64::from(line_no), dedup_hash)),
+            }),
+        )
+    } else {
+        let clause = format!(" AND timestamp_unix_nano < ?{ts_idx}");
+        (
+            clause,
+            Some(BoundLogCursorParams {
+                ts_ns: c.timestamp_unix_nano,
+                tie: None,
+            }),
+        )
+    }
+}
+
+pub(crate) fn push_cursor_params<'a>(
+    cursor_vals: &'a Option<BoundLogCursorParams>,
+    out: &mut Vec<&'a dyn duckdb::types::ToSql>,
+) {
+    if let Some(bound) = cursor_vals {
+        out.push(&bound.ts_ns);
+        if let Some((ln, dh)) = &bound.tie {
+            out.push(ln);
+            out.push(dh);
+        }
+    }
+}
+
+/// Builds an `O(query_terms)` parameterized DuckDB `WHERE` predicate for `v_logs` without
+/// materializing `dedup_hash IN (...)` parameter lists. Returns `None` when `token_query`
+/// yields zero valid tokens so callers return empty results cleanly.
+pub(crate) fn build_log_token_search_clause(
+    token_query: &str,
+    job_id_param_idx: usize,
+    next_param_idx: &mut usize,
+    str_params: &mut Vec<String>,
+) -> Option<String> {
+    let query_tokens = tokenize_query_text(token_query);
+    if query_tokens.is_empty() {
+        return None;
+    }
+
+    let mut per_token_clauses = Vec::with_capacity(query_tokens.len());
+    for tok in &query_tokens {
+        let tok_idx = *next_param_idx;
+        *next_param_idx += 1;
+        str_params.push(tok.clone());
+
+        let aliases = expand_service_query_aliases(tok);
+        let mut alias_placeholders = Vec::with_capacity(aliases.len());
+        for alias in aliases {
+            let idx = *next_param_idx;
+            *next_param_idx += 1;
+            str_params.push(alias);
+            alias_placeholders.push(format!("?{idx}"));
+        }
+        let in_list = alias_placeholders.join(", ");
+
+        per_token_clauses.push(format!(
+            "((\
+                v_logs.dedup_hash != 0 \
+                AND EXISTS (\
+                    SELECT 1 FROM log_inverted_index idx \
+                    WHERE idx.dedup_hash = v_logs.dedup_hash \
+                      AND (?{job_id_param_idx} IS NULL OR idx.job_id = ?{job_id_param_idx}) \
+                      AND (idx.token IN ({in_list}) OR LOWER(idx.service_name) IN ({in_list}))\
+                )\
+            ) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.body, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.service_name, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.trace_id, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.span_id, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.severity_text, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.node_id, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.job_id, '')), ?{tok_idx}) \
+            OR CONTAINS(LOWER(COALESCE(v_logs.stage_id, '')), ?{tok_idx}) \
+            OR LOWER(COALESCE(v_logs.service_name, '')) IN ({in_list}))"
+        ));
+    }
+
+    Some(per_token_clauses.join(" AND "))
+}
+
+pub(crate) fn map_v_logs_row(
+    r: &duckdb::Row<'_>,
+    redactor: &PrivacyRedactor,
+) -> duckdb::Result<ConsoleLogItem> {
+    let ts_ns: i64 = r.get(0)?;
+    let raw_svc: String = r.get(5)?;
+    let raw_node: String = r.get(6)?;
+    let raw_body: String = r.get(7)?;
+    let raw_attrs: String = r.get(8)?;
+    let line_no_u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
+    let stream_u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
+    let dedup_hash_u64 = r.get::<_, u64>(13).unwrap_or(0);
+    let clean_svc = redactor.redact_str(&raw_svc);
+    Ok(ConsoleLogItem {
+        timestamp_unix_nano: ts_ns,
+        timestamp_ms: ts_ns / 1_000_000,
+        trace_id: r.get(1)?,
+        span_id: r.get(2)?,
+        severity_number: r.get(3)?,
+        severity_text: r.get(4)?,
+        service: clean_svc.clone(),
+        service_name: clean_svc,
+        node_id: redactor.redact_host(&raw_node),
+        body: redactor.redact_str(&raw_body),
+        attributes: redactor.redact_attributes_json(&raw_attrs),
+        job_id: r.get(9)?,
+        stage_id: r.get(10)?,
+        line_no: line_no_u32,
+        stream: stream_u8,
+        dedup_hash: dedup_hash_u64,
+    })
 }
 
 /// Expands a query token into canonical platform service aliases when it matches a known
@@ -1003,7 +1218,7 @@ impl HotDuckDbStore {
     }
 
     /// Searches logs via the OpenSearch-style inverted token index (`log_inverted_index`),
-    /// joining against `v_logs` (spanning both hot DuckDB and cold Parquet shards), and returns
+    /// substring/metadata matching across `v_logs`, and service alias expansion, returning
     /// sanitized [`SanitizedLogRecord`] rows ordered by `timestamp_unix_nano DESC, line_no DESC`.
     pub fn search_logs_by_token(
         &self,
@@ -1014,9 +1229,9 @@ impl HotDuckDbStore {
         self.search_logs_by_token_filtered(token_query, None, None, None, job_id, None, None, limit)
     }
 
-    /// Searches logs via the OpenSearch-style inverted token index (`log_inverted_index`) with
-    /// full SQL predicate pushdown (`trace_id`, `job_id`, `sev_range`, case-insensitive `service`,
-    /// and `from_ns`/`to_ns` timestamp bounds) applied before `ORDER BY ... LIMIT`.
+    /// Searches logs with full SQL predicate pushdown (`trace_id`, `job_id`, `sev_range`,
+    /// case-insensitive `service`, `from_ns`/`to_ns` timestamp bounds, and `O(query_terms)` token
+    /// + substring predicates) applied before `ORDER BY ... LIMIT`.
     #[allow(clippy::too_many_arguments)]
     pub fn search_logs_by_token_filtered(
         &self,
@@ -1029,32 +1244,90 @@ impl HotDuckDbStore {
         to_ns: Option<i64>,
         limit: usize,
     ) -> Result<Vec<SanitizedLogRecord>, StorageError> {
+        let (rows, _, _) = self.search_logs_by_token_paginated(
+            token_query,
+            sev_range,
+            service_filter,
+            trace_id_filter,
+            job_id,
+            from_ns,
+            to_ns,
+            None,
+            limit,
+        )?;
+        Ok(rows)
+    }
+
+    /// Searches logs using an `O(query_terms)` parameterized SQL predicate across `v_logs`
+    /// and `log_inverted_index` with keyset cursor pagination (`before`), returning
+    /// `(rows, has_more, total_matched)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_logs_by_token_paginated(
+        &self,
+        token_query: &str,
+        sev_range: Option<(i32, i32, &str)>,
+        service_filter: Option<&str>,
+        trace_id_filter: Option<&str>,
+        job_id: Option<&str>,
+        from_ns: Option<i64>,
+        to_ns: Option<i64>,
+        before: Option<LogPageCursor>,
+        limit: usize,
+    ) -> Result<(Vec<SanitizedLogRecord>, bool, u64), StorageError> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false, 0));
         }
 
         let bounded_limit = limit.clamp(1, 1000);
         let redactor = PrivacyRedactor::new();
         let conn = self.lock_conn()?;
 
-        let Some(matched_hashes) =
-            Self::candidate_hashes_for_query_conn(&conn, token_query, job_id)?
+        let mut next_param_idx = 9usize;
+        let mut token_params = Vec::new();
+        let Some(token_clause) =
+            build_log_token_search_clause(token_query, 2, &mut next_param_idx, &mut token_params)
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false, 0));
         };
-        if matched_hashes.is_empty() {
-            return Ok(Vec::new());
-        }
 
-        let matched_hashes_vec: Vec<u64> = matched_hashes.into_iter().collect();
         let (min_sev, max_sev, sev_text) = match sev_range {
             Some((min_n, max_n, txt)) => (Some(min_n), Some(max_n), Some(txt)),
             None => (None, None, None),
         };
-        let placeholders = (10..=matched_hashes_vec.len() + 9)
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+
+        let base_where = format!(
+            r#"
+            (?1 IS NULL OR trace_id = ?1)
+              AND (?2 IS NULL OR job_id = ?2)
+              AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL') OR (?5 = 'WARN' AND UPPER(severity_text) = 'WARNING') OR (?5 = 'DEBUG' AND UPPER(severity_text) = 'TRACE'))
+              AND (?6 IS NULL OR LOWER(service_name) = LOWER(?6))
+              AND (?7 IS NULL OR timestamp_unix_nano >= ?7)
+              AND (?8 IS NULL OR timestamp_unix_nano <= ?8)
+              AND {token_clause}
+            "#
+        );
+
+        let mut count_params: Vec<&dyn duckdb::types::ToSql> =
+            Vec::with_capacity(8 + token_params.len());
+        count_params.push(&trace_id_filter);
+        count_params.push(&job_id);
+        count_params.push(&min_sev);
+        count_params.push(&max_sev);
+        count_params.push(&sev_text);
+        count_params.push(&service_filter);
+        count_params.push(&from_ns);
+        count_params.push(&to_ns);
+        for s in &token_params {
+            count_params.push(s);
+        }
+        let count_sql = format!("SELECT COUNT(*) FROM v_logs WHERE {base_where}");
+        let total_matched: u64 = conn
+            .query_row(&count_sql, &count_params[..], |r| r.get::<_, i64>(0))
+            .map(|c| c.max(0) as u64)?;
+
+        let (cursor_clause, cursor_vals) = append_log_cursor_clause(before, &mut next_param_idx);
+        let lim_idx = next_param_idx;
+        let lim = (bounded_limit + 1) as i64;
 
         let sql = format!(
             r#"
@@ -1063,68 +1336,31 @@ impl HotDuckDbStore {
                 service_name, node_id, body, attributes_json, job_id, stage_id,
                 COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
             FROM v_logs
-            WHERE (?1 IS NULL OR trace_id = ?1)
-              AND (?2 IS NULL OR job_id = ?2)
-              AND (?3 IS NULL OR (severity_number >= ?3 AND severity_number <= ?4) OR UPPER(severity_text) = ?5 OR (?5 = 'ERROR' AND UPPER(severity_text) = 'FATAL') OR (?5 = 'WARN' AND UPPER(severity_text) = 'WARNING') OR (?5 = 'DEBUG' AND UPPER(severity_text) = 'TRACE'))
-              AND (?6 IS NULL OR LOWER(service_name) = LOWER(?6))
-              AND (?7 IS NULL OR timestamp_unix_nano >= ?7)
-              AND (?8 IS NULL OR timestamp_unix_nano <= ?8)
-              AND dedup_hash IN ({placeholders})
-            ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC
-            LIMIT ?9
+            WHERE {base_where}
+              {cursor_clause}
+            ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC, COALESCE(dedup_hash, 0) DESC
+            LIMIT ?{lim_idx}
             "#
         );
 
-        let lim = bounded_limit as i64;
         let mut param_refs: Vec<&dyn duckdb::types::ToSql> =
-            Vec::with_capacity(matched_hashes_vec.len() + 9);
-        param_refs.push(&trace_id_filter);
-        param_refs.push(&job_id);
-        param_refs.push(&min_sev);
-        param_refs.push(&max_sev);
-        param_refs.push(&sev_text);
-        param_refs.push(&service_filter);
-        param_refs.push(&from_ns);
-        param_refs.push(&to_ns);
+            Vec::with_capacity(count_params.len() + 4);
+        param_refs.extend_from_slice(&count_params);
+        push_cursor_params(&cursor_vals, &mut param_refs);
         param_refs.push(&lim);
-        for h in &matched_hashes_vec {
-            param_refs.push(h);
-        }
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(&param_refs[..], |r| {
-            let ts_ns: i64 = r.get(0)?;
-            let raw_svc: String = r.get(5)?;
-            let raw_node: String = r.get(6)?;
-            let raw_body: String = r.get(7)?;
-            let raw_attrs: String = r.get(8)?;
-            let line_no_u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
-            let stream_u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
-            let clean_svc = redactor.redact_str(&raw_svc);
-            Ok(SanitizedLogRecord {
-                timestamp_unix_nano: ts_ns,
-                timestamp_ms: ts_ns / 1_000_000,
-                trace_id: r.get(1)?,
-                span_id: r.get(2)?,
-                severity_number: r.get(3)?,
-                severity_text: r.get(4)?,
-                service: clean_svc.clone(),
-                service_name: clean_svc,
-                node_id: redactor.redact_host(&raw_node),
-                body: redactor.redact_str(&raw_body),
-                attributes: redactor.redact_attributes_json(&raw_attrs),
-                job_id: r.get(9)?,
-                stage_id: r.get(10)?,
-                line_no: line_no_u32,
-                stream: stream_u8,
-            })
-        })?;
+        let rows = stmt.query_map(&param_refs[..], |r| map_v_logs_row(r, &redactor))?;
 
-        let mut out = Vec::with_capacity(bounded_limit);
+        let mut out = Vec::with_capacity(bounded_limit + 1);
         for r in rows {
             out.push(r?);
         }
-        Ok(out)
+        let has_more = out.len() > bounded_limit;
+        if has_more {
+            out.truncate(bounded_limit);
+        }
+        Ok((out, has_more, total_matched))
     }
 
     /// Reconstructs and sanitizes the full execution log for `job_id` line-by-line from `v_logs`
@@ -3441,5 +3677,122 @@ mod tests {
             .expect("search alias scoped to job_id");
         assert_eq!(job_hits.len(), 1);
         assert_eq!(job_hits[0].trace_id, "tr-muregist-long");
+    }
+
+    #[test]
+    fn test_parse_and_format_log_cursor_and_token_search_clause() {
+        assert_eq!(
+            parse_log_cursor("1700000000000000000"),
+            Ok(LogPageCursor {
+                timestamp_unix_nano: 1_700_000_000_000_000_000,
+                line_no: None,
+                dedup_hash: None,
+            })
+        );
+        let formatted = format_log_cursor(1_700_000_000_000_000_000, 42, u64::MAX);
+        assert_eq!(formatted, format!("1700000000000000000:42:{}", u64::MAX));
+        assert_eq!(
+            parse_log_cursor(&formatted),
+            Ok(LogPageCursor {
+                timestamp_unix_nano: 1_700_000_000_000_000_000,
+                line_no: Some(42),
+                dedup_hash: Some(u64::MAX),
+            })
+        );
+
+        for invalid in ["", "   ", "-1", "abc", "123:45", "123:45:67:89", "123:x:45"] {
+            assert!(
+                parse_log_cursor(invalid).is_err(),
+                "cursor '{invalid}' must fail validation"
+            );
+        }
+
+        for empty_q in ["", "x", "-", "===="] {
+            let mut next_idx = 9;
+            let mut params = Vec::new();
+            assert!(
+                build_log_token_search_clause(empty_q, 2, &mut next_idx, &mut params).is_none(),
+                "empty token query '{empty_q}' must return None"
+            );
+            assert!(params.is_empty());
+        }
+
+        let mut next_idx = 9;
+        let mut params = Vec::new();
+        let clause = build_log_token_search_clause("muregist err", 2, &mut next_idx, &mut params)
+            .expect("valid query builds SQL clause");
+        assert!(clause.contains("EXISTS (SELECT 1 FROM log_inverted_index idx"));
+        assert!(clause.contains("CONTAINS(LOWER(COALESCE(v_logs.body, '')), ?9)"));
+        assert!(params.contains(&"mu-registry".to_string()));
+        assert!(params.contains(&"err".to_string()));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_search_substring_metadata_and_large_match_count_without_param_explosion() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let base_ts = 1_700_000_050_000_000_000i64;
+
+        let mut entries = Vec::with_capacity(5102);
+        for i in 0..5100 {
+            entries.push(OtelLogEntry {
+                timestamp_unix_nano: base_ts + (i as i64) * 1_000,
+                trace_id: format!("tr-bulk-{i}"),
+                span_id: format!("sp-bulk-{i}"),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "bulk-service".into(),
+                node_id: "node-a".into(),
+                body: format!("common_burst payload line #{i}"),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            });
+        }
+        entries.push(OtelLogEntry {
+            timestamp_unix_nano: base_ts + 10_000_000,
+            trace_id: "tr-needle-99".into(),
+            span_id: "sp-needle-77".into(),
+            severity_number: 17,
+            severity_text: "ERROR".into(),
+            service_name: "mu-registry".into(),
+            node_id: "worker-riscv64".into(),
+            body: "crate handshake refused".into(),
+            attributes_json: "{}".into(),
+            job_id: Some("job-sub-7".into()),
+            stage_id: Some("stage-pack".into()),
+        });
+        store.insert_logs(&entries).expect("insert 5101 logs");
+
+        // 1. >5,000 matches must succeed without DuckDB parameter explosion
+        let (page, has_more, total_matched) = store
+            .search_logs_by_token_paginated(
+                "common_burst",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                200,
+            )
+            .expect("search >5000 matching rows");
+        assert_eq!(page.len(), 200);
+        assert!(has_more);
+        assert_eq!(total_matched, 5100);
+
+        // 2. Substring matching across service_name, trace_id, span_id, and severity_text
+        for q in ["regis", "err", "tr-needle", "sp-needle", "stage-pack"] {
+            let hits = store
+                .search_logs_by_token(q, None, 10)
+                .expect("substring/metadata search");
+            assert_eq!(
+                hits.len(),
+                1,
+                "expected 1 match for substring query '{q}', got {hits:?}"
+            );
+            assert_eq!(hits[0].trace_id, "tr-needle-99");
+        }
     }
 }
