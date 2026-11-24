@@ -9,7 +9,7 @@ const VIEW_SPECS: &[(&str, &str, &str, &str)] = &[
         "v_logs",
         "otel_logs",
         "logs",
-        "timestamp_unix_nano, trace_id, span_id, severity_number, severity_text, service_name, node_id, body, attributes_json, job_id, stage_id, COALESCE(line_no, 0::UINTEGER) AS line_no, COALESCE(stream, 1::UTINYINT) AS stream, COALESCE(dedup_hash, 0::UBIGINT) AS dedup_hash",
+        "timestamp_unix_nano, trace_id, span_id, severity_number, severity_text, service_name, node_id, body, attributes_json, job_id, stage_id, COALESCE(line_no, 0::UINTEGER) AS line_no, COALESCE(stream, 1::UTINYINT) AS stream, COALESCE(NULLIF(dedup_hash, 0::UBIGINT), hash(timestamp_unix_nano, COALESCE(service_name, ''), COALESCE(trace_id, ''), COALESCE(span_id, ''), COALESCE(body, ''), COALESCE(line_no, 0::UINTEGER))::UBIGINT) AS dedup_hash",
     ),
     (
         "v_traces",

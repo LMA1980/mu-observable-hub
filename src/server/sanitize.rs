@@ -128,8 +128,8 @@ fn alias_internal_hostnames_keep_shortname_domains(input: &str) -> String {
     replace_internal_host_tokens(input)
 }
 
-fn replace_internal_host_tokens(input: &str) -> String {
-    let mut s = input.to_string();
+fn configured_hostname_alias_pairs() -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
     let mappings_opt = crate::config::non_empty_env_first(&[
         "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
         "MU_OBSERVABLE_HOSTNAME_ALIASES",
@@ -143,10 +143,117 @@ fn replace_internal_host_tokens(input: &str) -> String {
                 let k_trim = k.trim();
                 let v_trim = v.trim();
                 if !k_trim.is_empty() && !v_trim.is_empty() {
-                    s = replace_token_boundary_ci(&s, k_trim, v_trim);
+                    pairs.push((k_trim.to_string(), v_trim.to_string()));
                 }
             }
         }
+    }
+    pairs
+}
+
+/// Returns raw configured internal hostname keys `[k1, ...]` whose public alias `v` (`k != v`)
+/// matches `token` (after lowercasing and stripping an optional `.example.invalid` suffix).
+pub(crate) fn reverse_hostname_aliases_for_token(token: &str) -> Vec<String> {
+    let lower = token.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return Vec::new();
+    }
+    let bare = lower.strip_suffix(".example.invalid").unwrap_or(&lower);
+    let mut out = Vec::new();
+    for (k, v) in configured_hostname_alias_pairs() {
+        let k_lower = k.to_ascii_lowercase();
+        let v_lower = v.to_ascii_lowercase();
+        if k_lower == v_lower {
+            continue;
+        }
+        let v_bare = v_lower.strip_suffix(".example.invalid").unwrap_or(&v_lower);
+        if bare == v_bare || lower == v_lower {
+            if !out.contains(&k_lower) {
+                out.push(k_lower.clone());
+            }
+            if let Some((k_short, _)) = k_lower.split_once('.') {
+                if !k_short.is_empty()
+                    && k_short != v_bare
+                    && k_short != v_lower
+                    && !out.contains(&k_short.to_string())
+                {
+                    out.push(k_short.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Returns `true` if `token` probes a configured raw internal hostname `k` (`k != v`), an
+/// internal domain suffix (`.corp.internal`, `.internal`, `.local`), or a Stage-3 secret prefix
+/// (`ghp_`, `github_pat_`, `glpat-`, `sk-`, `ak_`, `gho_`, `ghs_`, `ghr_`, `akia`).
+pub(crate) fn is_sensitive_or_oracle_query_token(token: &str) -> bool {
+    const SECRET_PREFIXES: &[&str] = &[
+        "ghp_",
+        "github_pat_",
+        "glpat-",
+        "sk-",
+        "ak_",
+        "gho_",
+        "ghs_",
+        "ghr_",
+        "akia",
+    ];
+    const INTERNAL_SUFFIXES: &[&str] = &[".corp.internal", ".internal", ".local"];
+
+    let lower = token.trim().to_ascii_lowercase();
+    let body = lower.strip_prefix("svc:").unwrap_or(&lower);
+    if body.is_empty() {
+        return false;
+    }
+
+    let mut raw_hosts: Vec<String> = Vec::new();
+    for (k, v) in configured_hostname_alias_pairs() {
+        let k_lower = k.to_ascii_lowercase();
+        let v_lower = v.to_ascii_lowercase();
+        if k_lower == v_lower {
+            continue;
+        }
+        let v_bare = v_lower.strip_suffix(".example.invalid").unwrap_or(&v_lower);
+        if !raw_hosts.contains(&k_lower) {
+            raw_hosts.push(k_lower.clone());
+        }
+        if let Some((k_short, _)) = k_lower.split_once('.') {
+            if !k_short.is_empty()
+                && k_short != v_bare
+                && k_short != v_lower
+                && !raw_hosts.contains(&k_short.to_string())
+            {
+                raw_hosts.push(k_short.to_string());
+            }
+        }
+    }
+
+    std::iter::once(body)
+        .chain(body.split(['=', '<', '>', '/', ':']))
+        .any(|seg| {
+            let clean =
+                seg.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ','));
+            if clean.is_empty() {
+                return false;
+            }
+            if SECRET_PREFIXES.iter().any(|p| clean.starts_with(p)) {
+                return true;
+            }
+            let no_dot = clean.trim_end_matches('.');
+            if INTERNAL_SUFFIXES.iter().any(|suf| no_dot.ends_with(suf)) {
+                return true;
+            }
+            let bare = no_dot.strip_suffix(".example.invalid").unwrap_or(no_dot);
+            raw_hosts.iter().any(|raw| no_dot == raw || bare == raw)
+        })
+}
+
+fn replace_internal_host_tokens(input: &str) -> String {
+    let mut s = input.to_string();
+    for (k_trim, v_trim) in configured_hostname_alias_pairs() {
+        s = replace_token_boundary_ci(&s, &k_trim, &v_trim);
     }
     s
 }
@@ -659,6 +766,53 @@ const fn is_path_char(b: u8) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) static HOSTNAME_ALIAS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct ScopedAliasEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl ScopedAliasEnv {
+    const KEYS: &[&'static str] = &[
+        "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+        "MU_OBSERVABLE_HOSTNAME_ALIASES",
+        "MUOBSERVE_HOSTNAME_ALIASES",
+        "MU_CD_CONTROLLER_NODE_MAP",
+        "MUCONDE_NODE_MAP",
+    ];
+
+    pub(crate) fn acquire_cleared() -> Self {
+        let guard = HOSTNAME_ALIAS_ENV_LOCK.lock().expect("alias env lock");
+        let saved = Self::KEYS
+            .iter()
+            .map(|&k| (k, std::env::var(k).ok()))
+            .collect();
+        for &k in Self::KEYS {
+            std::env::remove_var(k);
+        }
+        Self {
+            _guard: guard,
+            saved,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedAliasEnv {
+    fn drop(&mut self) {
+        for (k, v) in self.saved.drain(..) {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -680,21 +834,18 @@ mod tests {
         format!("{}.{}.100.55", 192, 168)
     }
 
-    static ALIAS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn init_test_aliases() {
-        std::env::remove_var("MU_OBSERVABLE_HUB_HOSTNAME_ALIASES");
-        std::env::remove_var("MU_OBSERVABLE_HOSTNAME_ALIASES");
+    fn init_test_aliases() -> ScopedAliasEnv {
+        let guard = ScopedAliasEnv::acquire_cleared();
         std::env::set_var(
             "MUOBSERVE_HOSTNAME_ALIASES",
             "test-host-alpha:node-a,test-host-beta:node-b,test-worker-riscv:worker-riscv64",
         );
+        guard
     }
 
     #[test]
     fn test_stage1_hostname_and_domain_aliasing() {
-        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
-        init_test_aliases();
+        let _guard = init_test_aliases();
         let p = TEST_HOST_P;
         let e = TEST_HOST_E;
         let r = TEST_HOST_R;
@@ -760,8 +911,7 @@ mod tests {
             "file .../src/main.rs:42"
         );
 
-        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
-        init_test_aliases();
+        let _guard = init_test_aliases();
         let redactor = PrivacyRedactor::new();
         let e = TEST_HOST_E;
         let d = TEST_DOMAIN_SUFFIX;
@@ -786,8 +936,7 @@ mod tests {
 
     #[test]
     fn test_property_zero_leakage_across_arbitrary_corpus_and_json_dtos() {
-        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
-        init_test_aliases();
+        let _guard = init_test_aliases();
         let redactor = PrivacyRedactor::new();
         let p = TEST_HOST_P;
         let e = TEST_HOST_E;
@@ -882,19 +1031,7 @@ mod tests {
 
     #[test]
     fn test_canonical_hub_hostname_aliases_env_precedence() {
-        let _lock = ALIAS_ENV_LOCK.lock().expect("alias env lock");
-        let keys = [
-            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
-            "MU_OBSERVABLE_HOSTNAME_ALIASES",
-            "MUOBSERVE_HOSTNAME_ALIASES",
-            "MU_CD_CONTROLLER_NODE_MAP",
-            "MUCONDE_NODE_MAP",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
-        for k in keys {
-            std::env::remove_var(k);
-        }
+        let _guard = ScopedAliasEnv::acquire_cleared();
 
         std::env::set_var("MUOBSERVE_HOSTNAME_ALIASES", "internal-host-1:legacy-node");
         assert_eq!(alias_internal_hostnames("internal-host-1"), "legacy-node");
@@ -907,12 +1044,69 @@ mod tests {
             alias_internal_hostnames("internal-host-1"),
             "canonical-node"
         );
+    }
 
-        for (k, v) in saved {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
+    #[test]
+    fn test_reverse_hostname_aliases_and_sensitive_oracle_token_guard() {
+        let _guard = ScopedAliasEnv::acquire_cleared();
+        std::env::set_var(
+            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+            "raw-alpha:node-a,raw-beta.corp.internal:node-b,worker-riscv64:worker-riscv64",
+        );
+
+        assert_eq!(
+            reverse_hostname_aliases_for_token("node-a"),
+            vec!["raw-alpha".to_string()]
+        );
+        assert_eq!(
+            reverse_hostname_aliases_for_token("node-a.example.invalid"),
+            vec!["raw-alpha".to_string()]
+        );
+        assert_eq!(
+            reverse_hostname_aliases_for_token("node-b"),
+            vec!["raw-beta.corp.internal".to_string(), "raw-beta".to_string()]
+        );
+        assert!(
+            reverse_hostname_aliases_for_token("worker-riscv64").is_empty(),
+            "identity mapping k == v must not emit redundant reverse lookup"
+        );
+
+        for blocked in [
+            "raw-alpha",
+            "raw-alpha.example.invalid",
+            "raw-beta",
+            "raw-beta.corp.internal",
+            "host.internal",
+            "box.local",
+            "ghp_secret123",
+            "github_pat_123",
+            "glpat-abc123",
+            "sk-live-999",
+            "ak_prod_001",
+            "token=ghp_secret123",
+            "svc:raw-alpha",
+        ] {
+            assert!(
+                is_sensitive_or_oracle_query_token(blocked),
+                "expected oracle guard to reject '{blocked}'"
+            );
+        }
+
+        for allowed in [
+            "node-a",
+            "node-a.example.invalid",
+            "node-b",
+            "worker-riscv64",
+            "internal",
+            "localhost",
+            "task-1",
+            "token",
+            "svc:muregist",
+        ] {
+            assert!(
+                !is_sensitive_or_oracle_query_token(allowed),
+                "expected oracle guard to allow '{allowed}'"
+            );
         }
     }
 }

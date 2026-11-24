@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 
 use crate::error::MuObserveError;
 use crate::server::console_api::ConsoleLogItem;
-use crate::server::sanitize::PrivacyRedactor;
+use crate::server::sanitize::{
+    is_sensitive_or_oracle_query_token, reverse_hostname_aliases_for_token, PrivacyRedactor,
+};
 use crate::storage::views::{escape_sql_literal, register_unified_views};
 
 /// Type alias for [`MuObserveError`] used across storage operations.
@@ -205,7 +207,22 @@ pub fn tokenize_log_line(entry: &OtelLogEntry, line_body: &str) -> Vec<String> {
 pub(crate) fn tokenize_query_text(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    tokenize_text_into(query, &mut seen, &mut out, None);
+    for word in query.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        if let Some(rest) = lower
+            .strip_prefix("svc:")
+            .or_else(|| lower.strip_prefix("service:"))
+        {
+            let mut svc_seen = HashSet::new();
+            let mut svc_tokens = Vec::new();
+            tokenize_text_into(rest, &mut svc_seen, &mut svc_tokens, None);
+            for st in svc_tokens {
+                push_unique_token(format!("svc:{st}"), &mut seen, &mut out, None);
+            }
+        } else {
+            tokenize_text_into(word, &mut seen, &mut out, None);
+        }
+    }
     out
 }
 
@@ -301,8 +318,8 @@ pub(crate) fn append_log_cursor_clause(
         *next_param_idx += 2;
         let clause = format!(
             " AND (timestamp_unix_nano < ?{ts_idx} \
-             OR (timestamp_unix_nano = ?{ts_idx} AND COALESCE(line_no, 0) < ?{ln_idx}) \
-             OR (timestamp_unix_nano = ?{ts_idx} AND COALESCE(line_no, 0) = ?{ln_idx} AND COALESCE(dedup_hash, 0) < ?{dh_idx}))"
+             OR (timestamp_unix_nano = ?{ts_idx} AND COALESCE(line_no, 0::UINTEGER) < ?{ln_idx}) \
+             OR (timestamp_unix_nano = ?{ts_idx} AND COALESCE(line_no, 0::UINTEGER) = ?{ln_idx} AND COALESCE(dedup_hash, 0::UBIGINT) < ?{dh_idx}))"
         );
         (
             clause,
@@ -338,33 +355,93 @@ pub(crate) fn push_cursor_params<'a>(
 
 /// Builds an `O(query_terms)` parameterized DuckDB `WHERE` predicate for `v_logs` without
 /// materializing `dedup_hash IN (...)` parameter lists. Returns `None` when `token_query`
-/// yields zero valid tokens so callers return empty results cleanly.
+/// yields zero valid tokens or trips the sensitive/oracle token guard so callers return empty
+/// results cleanly.
 pub(crate) fn build_log_token_search_clause(
     token_query: &str,
     job_id_param_idx: usize,
     next_param_idx: &mut usize,
     str_params: &mut Vec<String>,
 ) -> Option<String> {
+    if token_query
+        .split_whitespace()
+        .any(is_sensitive_or_oracle_query_token)
+    {
+        return None;
+    }
+
     let query_tokens = tokenize_query_text(token_query);
-    if query_tokens.is_empty() {
+    if query_tokens.is_empty()
+        || query_tokens
+            .iter()
+            .any(|t| is_sensitive_or_oracle_query_token(t))
+    {
         return None;
     }
 
     let mut per_token_clauses = Vec::with_capacity(query_tokens.len());
     for tok in &query_tokens {
+        if let Some(bare_svc) = tok.strip_prefix("svc:") {
+            let bare_idx = *next_param_idx;
+            *next_param_idx += 1;
+            str_params.push(bare_svc.to_owned());
+
+            let aliases = expand_service_query_aliases(tok);
+            let mut alias_placeholders = Vec::with_capacity(aliases.len());
+            for alias in aliases {
+                let idx = *next_param_idx;
+                *next_param_idx += 1;
+                str_params.push(alias);
+                alias_placeholders.push(format!("?{idx}"));
+            }
+            let in_list = alias_placeholders.join(", ");
+
+            per_token_clauses.push(format!(
+                "(LOWER(COALESCE(v_logs.service_name, '')) IN ({in_list}) \
+                 OR CONTAINS(LOWER(COALESCE(v_logs.service_name, '')), ?{bare_idx}) \
+                 OR (v_logs.dedup_hash != 0 AND EXISTS (\
+                     SELECT 1 FROM log_inverted_index idx \
+                     WHERE idx.dedup_hash = v_logs.dedup_hash \
+                       AND (?{job_id_param_idx} IS NULL OR idx.job_id = ?{job_id_param_idx}) \
+                       AND LOWER(idx.service_name) IN ({in_list})\
+                 )))"
+            ));
+            continue;
+        }
+
         let tok_idx = *next_param_idx;
         *next_param_idx += 1;
         str_params.push(tok.clone());
 
         let aliases = expand_service_query_aliases(tok);
-        let mut alias_placeholders = Vec::with_capacity(aliases.len());
-        for alias in aliases {
+        let mut svc_placeholders = Vec::with_capacity(aliases.len());
+        let mut idx_token_placeholders = Vec::with_capacity(aliases.len());
+        for alias in &aliases {
             let idx = *next_param_idx;
             *next_param_idx += 1;
-            str_params.push(alias);
-            alias_placeholders.push(format!("?{idx}"));
+            str_params.push(alias.clone());
+            let ph = format!("?{idx}");
+            svc_placeholders.push(ph.clone());
+            idx_token_placeholders.push(ph);
         }
-        let in_list = alias_placeholders.join(", ");
+        let svc_in_list = svc_placeholders.join(", ");
+
+        let reverse_hosts = reverse_hostname_aliases_for_token(tok);
+        let mut raw_host_predicates = String::new();
+        for raw_host in reverse_hosts {
+            if !aliases.iter().any(|a| a == &raw_host) {
+                let raw_idx = *next_param_idx;
+                *next_param_idx += 1;
+                str_params.push(raw_host);
+                idx_token_placeholders.push(format!("?{raw_idx}"));
+                raw_host_predicates.push_str(&format!(
+                    " OR CONTAINS(LOWER(COALESCE(v_logs.node_id, '')), ?{raw_idx}) \
+                      OR CONTAINS(LOWER(COALESCE(v_logs.body, '')), ?{raw_idx}) \
+                      OR CONTAINS(LOWER(COALESCE(v_logs.attributes_json, '')), ?{raw_idx})"
+                ));
+            }
+        }
+        let idx_token_in_list = idx_token_placeholders.join(", ");
 
         per_token_clauses.push(format!(
             "((\
@@ -373,7 +450,7 @@ pub(crate) fn build_log_token_search_clause(
                     SELECT 1 FROM log_inverted_index idx \
                     WHERE idx.dedup_hash = v_logs.dedup_hash \
                       AND (?{job_id_param_idx} IS NULL OR idx.job_id = ?{job_id_param_idx}) \
-                      AND (idx.token IN ({in_list}) OR LOWER(idx.service_name) IN ({in_list}))\
+                      AND (idx.token IN ({idx_token_in_list}) OR LOWER(idx.service_name) IN ({svc_in_list}))\
                 )\
             ) \
             OR CONTAINS(LOWER(COALESCE(v_logs.body, '')), ?{tok_idx}) \
@@ -384,7 +461,8 @@ pub(crate) fn build_log_token_search_clause(
             OR CONTAINS(LOWER(COALESCE(v_logs.node_id, '')), ?{tok_idx}) \
             OR CONTAINS(LOWER(COALESCE(v_logs.job_id, '')), ?{tok_idx}) \
             OR CONTAINS(LOWER(COALESCE(v_logs.stage_id, '')), ?{tok_idx}) \
-            OR LOWER(COALESCE(v_logs.service_name, '')) IN ({in_list}))"
+            OR CONTAINS(LOWER(COALESCE(v_logs.attributes_json, '')), ?{tok_idx}) \
+            OR LOWER(COALESCE(v_logs.service_name, '')) IN ({svc_in_list}){raw_host_predicates})"
         ));
     }
 
@@ -402,7 +480,7 @@ pub(crate) fn map_v_logs_row(
     let raw_attrs: String = r.get(8)?;
     let line_no_u32 = r.get::<_, i64>(11).unwrap_or(0).max(0) as u32;
     let stream_u8 = r.get::<_, i64>(12).unwrap_or(1).clamp(1, 2) as u8;
-    let dedup_hash_u64 = r.get::<_, u64>(13).unwrap_or(0);
+    let dedup_hash_u64 = r.get::<_, u64>(13)?;
     let clean_svc = redactor.redact_str(&raw_svc);
     Ok(ConsoleLogItem {
         timestamp_unix_nano: ts_ns,
@@ -425,12 +503,16 @@ pub(crate) fn map_v_logs_row(
 }
 
 /// Expands a query token into canonical platform service aliases when it matches a known
-/// service group (after stripping an optional `svc:` prefix and `-`, `_`, ` ` separators),
-/// always preserving the original `tok` and deduplicating results.
+/// service group (after stripping an optional `svc:` prefix and `-`, `_`, ` ` separators).
+/// When `tok` begins with `svc:`, strips `svc:` to `bare_svc` (never emitting `"svc:..."`) and
+/// always includes `bare_svc`; otherwise preserves `tok` and deduplicates results.
 fn expand_service_query_aliases(tok: &str) -> Vec<String> {
-    let mut out = vec![tok.to_owned()];
     let lower = tok.to_ascii_lowercase();
-    let stripped = lower.strip_prefix("svc:").unwrap_or(&lower);
+    let (stripped, mut out) = if let Some(bare) = lower.strip_prefix("svc:") {
+        (bare, vec![bare.to_owned()])
+    } else {
+        (lower.as_str(), vec![tok.to_owned()])
+    };
     let compact: String = stripped
         .chars()
         .filter(|c| !matches!(c, '-' | '_' | ' '))
@@ -1027,7 +1109,7 @@ impl HotDuckDbStore {
             return Ok(0);
         }
 
-        let count = {
+        let (count, newly_inserted_indices) = {
             let conn = self.lock_conn()?;
             let mut dedup = self
                 .dedup_cache
@@ -1072,7 +1154,8 @@ impl HotDuckDbStore {
             )?;
 
             let mut count = 0u32;
-            for item in &expanded {
+            let mut newly_inserted_indices = Vec::new();
+            for (idx, item) in expanded.iter().enumerate() {
                 if dedup.contains(item.dedup_hash) {
                     continue;
                 }
@@ -1098,6 +1181,9 @@ impl HotDuckDbStore {
 
                 if inserted > 0 {
                     count = count.saturating_add(1);
+                    if newly_inserted_indices.len() < 100 {
+                        newly_inserted_indices.push(idx);
+                    }
                     let tokens = tokenize_log_line(&item.entry, &item.entry.body);
                     for tok in tokens {
                         inv_stmt.execute(params![
@@ -1114,16 +1200,20 @@ impl HotDuckDbStore {
             drop(inv_stmt);
             drop(log_stmt);
             conn.execute_batch("COMMIT;")?;
-            count
+            (count, newly_inserted_indices)
         };
 
         if count > 0 {
             self.record_write_and_maybe_flush();
             let redactor = PrivacyRedactor::new();
-            for item in expanded.iter().take(100) {
+            for idx in newly_inserted_indices {
+                let item = &expanded[idx];
                 let ev = serde_json::json!({
                     "log_entry": true,
-                    "timestamp_ms": (item.entry.timestamp_unix_nano / 1_000_000) as u64,
+                    "timestamp_ms": (item.entry.timestamp_unix_nano / 1_000_000).max(0) as u64,
+                    "timestamp_unix_nano": item.entry.timestamp_unix_nano,
+                    "line_no": item.line_no,
+                    "dedup_hash": item.dedup_hash,
                     "severity": item.entry.severity_text,
                     "service": redactor.redact_str(&item.entry.service_name),
                     "trace_id": item.entry.trace_id,
@@ -1167,38 +1257,82 @@ impl HotDuckDbStore {
         token_query: &str,
         job_id: Option<&str>,
     ) -> Result<Option<HashSet<u64>>, StorageError> {
+        if token_query
+            .split_whitespace()
+            .any(is_sensitive_or_oracle_query_token)
+        {
+            return Ok(Some(HashSet::new()));
+        }
+
         let query_tokens = tokenize_query_text(token_query);
         if query_tokens.is_empty() {
             return Ok(None);
         }
+        if query_tokens
+            .iter()
+            .any(|t| is_sensitive_or_oracle_query_token(t))
+        {
+            return Ok(Some(HashSet::new()));
+        }
 
         let mut candidate_hashes: Option<HashSet<u64>> = None;
         for tok in &query_tokens {
-            let aliases = expand_service_query_aliases(tok);
-            let k = aliases.len();
-            let token_placeholders = (2..=1 + k)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let svc_placeholders = (2 + k..=1 + 2 * k)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                r#"
-                SELECT DISTINCT dedup_hash
-                FROM log_inverted_index
-                WHERE (token IN ({token_placeholders}) OR LOWER(service_name) IN ({svc_placeholders}))
-                  AND (?1 IS NULL OR job_id = ?1)
-                "#
-            );
-            let mut param_refs: Vec<&dyn duckdb::types::ToSql> = Vec::with_capacity(1 + 2 * k);
+            let (sql, bound_strings): (String, Vec<String>) = if let Some(bare_svc) =
+                tok.strip_prefix("svc:")
+            {
+                let aliases = expand_service_query_aliases(tok);
+                let k = aliases.len();
+                let svc_placeholders = (2..=1 + k)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let bare_idx = 2 + k;
+                let sql = format!(
+                    r#"
+                        SELECT DISTINCT dedup_hash
+                        FROM log_inverted_index
+                        WHERE (LOWER(service_name) IN ({svc_placeholders}) OR CONTAINS(LOWER(service_name), ?{bare_idx}))
+                          AND (?1 IS NULL OR job_id = ?1)
+                        "#
+                );
+                let mut strs = aliases;
+                strs.push(bare_svc.to_owned());
+                (sql, strs)
+            } else {
+                let aliases = expand_service_query_aliases(tok);
+                let mut idx_tokens = aliases.clone();
+                for raw_host in reverse_hostname_aliases_for_token(tok) {
+                    if !idx_tokens.contains(&raw_host) {
+                        idx_tokens.push(raw_host);
+                    }
+                }
+                let tk = idx_tokens.len();
+                let sk = aliases.len();
+                let token_placeholders = (2..=1 + tk)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let svc_placeholders = (2 + tk..=1 + tk + sk)
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    r#"
+                        SELECT DISTINCT dedup_hash
+                        FROM log_inverted_index
+                        WHERE (token IN ({token_placeholders}) OR LOWER(service_name) IN ({svc_placeholders}))
+                          AND (?1 IS NULL OR job_id = ?1)
+                        "#
+                );
+                let mut strs = idx_tokens;
+                strs.extend(aliases);
+                (sql, strs)
+            };
+            let mut param_refs: Vec<&dyn duckdb::types::ToSql> =
+                Vec::with_capacity(1 + bound_strings.len());
             param_refs.push(&job_id);
-            for alias in &aliases {
-                param_refs.push(alias);
-            }
-            for alias in &aliases {
-                param_refs.push(alias);
+            for s in &bound_strings {
+                param_refs.push(s);
             }
             let mut idx_stmt = conn.prepare(&sql)?;
             let rows = idx_stmt.query_map(&param_refs[..], |r| r.get::<_, u64>(0))?;
@@ -1334,11 +1468,11 @@ impl HotDuckDbStore {
             SELECT
                 timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
                 service_name, node_id, body, attributes_json, job_id, stage_id,
-                COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
+                COALESCE(line_no, 0::UINTEGER), COALESCE(stream, 1::UTINYINT), COALESCE(dedup_hash, 0::UBIGINT)
             FROM v_logs
             WHERE {base_where}
               {cursor_clause}
-            ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC, COALESCE(dedup_hash, 0) DESC
+            ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0::UINTEGER) DESC, COALESCE(dedup_hash, 0::UBIGINT) DESC
             LIMIT ?{lim_idx}
             "#
         );
@@ -3532,10 +3666,23 @@ mod tests {
         let svc_prefixed = expand_service_query_aliases("svc:Mu-Registry");
         assert_eq!(
             svc_prefixed.first().map(String::as_str),
-            Some("svc:Mu-Registry")
+            Some("mu-registry")
         );
+        assert!(!svc_prefixed.iter().any(|s| s.starts_with("svc:")));
         assert!(svc_prefixed.contains(&"muregist".to_string()));
         assert!(svc_prefixed.contains(&"mu-registry".to_string()));
+        assert_eq!(
+            expand_service_query_aliases("svc:custom-app"),
+            vec!["custom-app".to_string()]
+        );
+        assert_eq!(
+            tokenize_query_text("svc:muregist SERVICE:Mu-Registry timeout"),
+            vec![
+                "svc:muregist".to_string(),
+                "svc:mu-registry".to_string(),
+                "timeout".to_string(),
+            ]
+        );
 
         assert!(expand_service_query_aliases("muconsole").contains(&"actionrunner-web".to_string()));
         assert!(
@@ -3794,5 +3941,238 @@ mod tests {
             );
             assert_eq!(hits[0].trace_id, "tr-needle-99");
         }
+    }
+
+    #[test]
+    fn test_svc_prefix_and_oracle_guard_in_build_log_token_search_clause() {
+        let _env = crate::server::sanitize::ScopedAliasEnv::acquire_cleared();
+        std::env::set_var(
+            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+            "secret-internal-host:node-a,worker-riscv64:worker-riscv64",
+        );
+
+        let mut next_idx = 9;
+        let mut params = Vec::new();
+        let svc_clause =
+            build_log_token_search_clause("svc:custom-app", 2, &mut next_idx, &mut params)
+                .expect("svc:custom-app must produce SQL clause");
+        assert!(svc_clause.contains("LOWER(COALESCE(v_logs.service_name, '')) IN"));
+        assert!(!svc_clause.contains("CONTAINS(LOWER(COALESCE(v_logs.body"));
+        assert!(params.contains(&"custom-app".to_string()));
+        assert!(!params.iter().any(|p| p.starts_with("svc:")));
+
+        let mut next_idx2 = 9;
+        let mut params2 = Vec::new();
+        let alias_clause = build_log_token_search_clause(
+            "node-a.example.invalid",
+            2,
+            &mut next_idx2,
+            &mut params2,
+        )
+        .expect("public alias must build reverse-mapped clause");
+        assert!(alias_clause.contains("CONTAINS(LOWER(COALESCE(v_logs.attributes_json, ''))"));
+        assert!(params2.contains(&"secret-internal-host".to_string()));
+
+        for blocked in [
+            "secret-internal-host",
+            "secret-internal-host.example.invalid",
+            "host.corp.internal",
+            "host.internal",
+            "host.local",
+            "ghp_123456",
+            "github_pat_123456",
+            "glpat-123456",
+            "sk-123456",
+            "ak_123456",
+            "error ghp_123456",
+        ] {
+            let mut idx = 9;
+            let mut p = Vec::new();
+            assert!(
+                build_log_token_search_clause(blocked, 2, &mut idx, &mut p).is_none(),
+                "oracle/sensitive query '{blocked}' must return None"
+            );
+            assert!(p.is_empty());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_svc_prefix_attributes_alias_oracle_and_sse_insert_logs_duckdb() {
+        let _env = crate::server::sanitize::ScopedAliasEnv::acquire_cleared();
+        std::env::set_var(
+            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+            "raw-alpha:node-a,raw-beta.corp.internal:node-b",
+        );
+
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let mut rx = store.subscribe_events();
+        let base_ts = 1_700_000_060_123_456_789i64;
+
+        let initial_entries = vec![
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts,
+                trace_id: "tr-svc-muregist".into(),
+                span_id: "sp-1".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "mu-registry".into(),
+                node_id: "raw-alpha".into(),
+                body: "published crate metadata".into(),
+                attributes_json: r#"{"line_no":7,"stream":1,"custom_tag":"canary-attr-42"}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts + 1_000,
+                trace_id: "tr-svc-custom".into(),
+                span_id: "sp-2".into(),
+                severity_number: 17,
+                severity_text: "ERROR".into(),
+                service_name: "custom-app".into(),
+                node_id: "raw-beta.corp.internal".into(),
+                body: "connect to raw-alpha.corp.internal failed ghp_supersecret123 sk-live-888 ak_key999"
+                    .into(),
+                attributes_json: r#"{"line_no":8,"host.name":"raw-beta.corp.internal"}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: base_ts + 2_000,
+                trace_id: "tr-body-mentions-muregist".into(),
+                span_id: "sp-3".into(),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "frontend".into(),
+                node_id: "node-c".into(),
+                body: "calling muregist over internal mesh".into(),
+                attributes_json: "{}".into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ];
+
+        assert_eq!(store.insert_logs(&initial_entries).expect("insert 3"), 3);
+
+        // Verify SSE payloads include timestamp_unix_nano, line_no, and dedup_hash
+        let mut emitted = Vec::new();
+        for _ in 0..3 {
+            let msg = rx.try_recv().expect("sse event");
+            let parsed: Value = serde_json::from_str(&msg).expect("json event");
+            emitted.push(parsed);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(emitted[0]["log_entry"], true);
+        assert_eq!(emitted[0]["timestamp_ms"], (base_ts / 1_000_000) as u64);
+        assert_eq!(emitted[0]["timestamp_unix_nano"], base_ts);
+        assert_eq!(emitted[0]["line_no"], 7);
+        assert!(emitted[0]["dedup_hash"].as_u64().unwrap_or(0) > 0);
+
+        // Re-inserting all duplicates emits 0 SSE events; leading duplicates + 100 new emit only the 100 new items
+        assert_eq!(store.insert_logs(&initial_entries).expect("insert dups"), 0);
+        assert!(rx.try_recv().is_err());
+
+        let mut mixed_batch = Vec::with_capacity(103);
+        mixed_batch.extend(initial_entries.iter().cloned());
+        for i in 0..100usize {
+            mixed_batch.push(OtelLogEntry {
+                timestamp_unix_nano: base_ts + 10_000 + (i as i64) * 1_000,
+                trace_id: format!("tr-new-{i:03}"),
+                span_id: format!("sp-new-{i:03}"),
+                severity_number: 9,
+                severity_text: "INFO".into(),
+                service_name: "custom-app".into(),
+                node_id: "node-c".into(),
+                body: format!("fresh batch event #{i}"),
+                attributes_json: format!(r#"{{"line_no":{}}}"#, i + 10),
+                job_id: None,
+                stage_id: None,
+            });
+        }
+        assert_eq!(
+            store.insert_logs(&mixed_batch).expect("insert 100 new"),
+            100
+        );
+        let mut batch_events = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            let parsed: Value = serde_json::from_str(&msg).expect("json event");
+            batch_events.push(parsed);
+        }
+        assert_eq!(batch_events.len(), 100);
+        assert!(batch_events
+            .iter()
+            .all(|v| v["trace_id"].as_str().unwrap_or("").starts_with("tr-new-")));
+        assert_eq!(batch_events[99]["trace_id"], "tr-new-099");
+
+        // 1. svc:muregist matches mu-registry ONLY (not frontend whose body says "muregist")
+        let svc_reg = store
+            .search_logs_by_token("svc:muregist", None, 20)
+            .expect("svc:muregist");
+        assert_eq!(svc_reg.len(), 1);
+        assert_eq!(svc_reg[0].trace_id, "tr-svc-muregist");
+
+        // 2. svc:custom-app matches custom-app
+        let svc_custom = store
+            .search_logs_by_token("SERVICE:Custom-App", None, 200)
+            .expect("svc:custom-app");
+        assert_eq!(svc_custom.len(), 101);
+
+        // 3. attributes_json search matches OTLP attribute not in body
+        let attr_hits = store
+            .search_logs_by_token("canary-attr-42", None, 10)
+            .expect("attributes_json search");
+        assert_eq!(attr_hits.len(), 1);
+        assert_eq!(attr_hits[0].trace_id, "tr-svc-muregist");
+
+        // 4. Reverse host-alias search: searching public alias matches raw internal node_id/body/attrs & redacts on read
+        let alias_a = store
+            .search_logs_by_token("node-a", None, 10)
+            .expect("node-a reverse lookup");
+        assert_eq!(alias_a.len(), 2);
+        let alias_a_invalid = store
+            .search_logs_by_token("node-a.example.invalid", None, 10)
+            .expect("node-a.example.invalid reverse lookup");
+        assert_eq!(alias_a_invalid.len(), 2);
+        assert_eq!(alias_a_invalid[0].trace_id, "tr-svc-custom");
+        assert_eq!(alias_a_invalid[1].trace_id, "tr-svc-muregist");
+        assert_eq!(alias_a_invalid[0].node_id, "node-b");
+        assert!(alias_a_invalid[0].body.contains("node-a.example.invalid"));
+        assert!(!alias_a_invalid[0].body.contains("raw-alpha"));
+
+        let alias_b = store
+            .search_logs_by_token("node-b", None, 10)
+            .expect("node-b reverse lookup");
+        assert_eq!(alias_b.len(), 1);
+        assert_eq!(alias_b[0].trace_id, "tr-svc-custom");
+
+        // 5. Raw internal hostname & secret oracle guard returns 0 hits
+        for oracle_q in [
+            "raw-alpha",
+            "raw-beta",
+            "raw-alpha.corp.internal",
+            "ghp_supersecret123",
+            "sk-live-888",
+            "ak_key999",
+            "failed ghp_supersecret123",
+        ] {
+            let hits = store
+                .search_logs_by_token(oracle_q, None, 10)
+                .expect("oracle query");
+            assert!(
+                hits.is_empty(),
+                "oracle query '{oracle_q}' must fail closed with 0 hits, got {hits:?}"
+            );
+            let hashes = store
+                .candidate_hashes_for_query(oracle_q, None)
+                .expect("candidate hashes");
+            assert_eq!(hashes, Some(HashSet::new()));
+        }
+
+        // candidate_hashes_for_query supports svc: and reverse aliases
+        let svc_hashes = store
+            .candidate_hashes_for_query("svc:muregist", None)
+            .expect("svc candidate hashes")
+            .expect("non-empty token");
+        assert_eq!(svc_hashes.len(), 1);
     }
 }
