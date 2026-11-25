@@ -1335,7 +1335,8 @@ fn parse_severity_filter(raw: Option<&str>) -> Result<(String, Option<SevRange>)
 }
 
 const LOG_FACET_BASE_WHERE: &str = r#"
-    timestamp_unix_nano >= ?1 AND timestamp_unix_nano <= ?2
+    (?1 IS NULL OR timestamp_unix_nano >= ?1)
+    AND (?2 IS NULL OR timestamp_unix_nano <= ?2)
     AND (?3 IS NULL OR LOWER(service_name) = LOWER(?3))
     AND (?4 IS NULL OR job_id = ?4)
     AND (?5 IS NULL OR trace_id = ?5)
@@ -1343,8 +1344,8 @@ const LOG_FACET_BASE_WHERE: &str = r#"
 "#;
 
 struct FacetSqlFilter<'a> {
-    from_ns: i64,
-    to_ns: i64,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
     service: &'a Option<String>,
     job_id: &'a Option<String>,
     trace_id: &'a Option<String>,
@@ -1408,25 +1409,28 @@ fn query_log_facets_data(
         .query_row(&count_sql, &base_params[..], |r| r.get(0))
         .unwrap_or(0);
 
-    // Query 2: services
-    let mut services = Vec::new();
+    // Query 2: services (redact and merge before top-50 truncation)
+    let mut merged_services: BTreeMap<String, u64> = BTreeMap::new();
     let svc_sql = format!(
-        "SELECT service_name, COUNT(*) AS cnt FROM v_logs WHERE {base_where} GROUP BY service_name ORDER BY cnt DESC LIMIT 50"
+        "SELECT service_name, COUNT(*) AS cnt FROM v_logs WHERE {base_where} GROUP BY service_name"
     );
     if let Ok(mut stmt) = conn.prepare(&svc_sql) {
         if let Ok(rows) = stmt.query_map(&base_params[..], |r| {
             let raw_svc: String = r.get(0)?;
             let count: i64 = r.get(1)?;
-            Ok(FacetCount {
-                name: redactor.redact_str(&raw_svc),
-                count: count.max(0) as u64,
-            })
+            Ok((redactor.redact_str(&raw_svc), count.max(0) as u64))
         }) {
-            for r in rows.flatten() {
-                services.push(r);
+            for (clean_svc, cnt) in rows.flatten() {
+                *merged_services.entry(clean_svc).or_insert(0) += cnt;
             }
         }
     }
+    let mut services: Vec<FacetCount> = merged_services
+        .into_iter()
+        .map(|(name, count)| FacetCount { name, count })
+        .collect();
+    services.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    services.truncate(50);
 
     // Query 3: levels
     let mut levels = Vec::new();
@@ -1604,14 +1608,8 @@ async fn handle_get_log_facets(
 
     let step_ms = params.step_ms.unwrap_or(60_000).clamp(1_000, 86_400_000);
     let step_ns = (step_ms as i64) * 1_000_000;
-    let from_ns = params
-        .from
-        .map(|f| f.max(0).saturating_mul(1_000_000))
-        .unwrap_or(0);
-    let to_ns = params
-        .to
-        .map(|t| t.max(0).saturating_mul(1_000_000))
-        .unwrap_or(i64::MAX);
+    let from_ns = params.from.map(|f| f.max(0).saturating_mul(1_000_000));
+    let to_ns = params.to.map(|t| t.max(0).saturating_mul(1_000_000));
 
     let (min_sev, max_sev, sev_text) = match sev_range {
         Some((min_n, max_n, txt)) => (Some(min_n), Some(max_n), Some(txt)),
@@ -2078,11 +2076,11 @@ fn query_v_logs_rows(
         SELECT
             timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
             service_name, node_id, body, attributes_json, job_id, stage_id,
-            COALESCE(line_no, 0), COALESCE(stream, 1), COALESCE(dedup_hash, 0)
+            COALESCE(line_no, 0::UINTEGER), COALESCE(stream, 1::UTINYINT), COALESCE(dedup_hash, 0::UBIGINT)
         FROM v_logs
         WHERE {base_where}
           {cursor_clause}
-        ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0) DESC, COALESCE(dedup_hash, 0) DESC
+        ORDER BY timestamp_unix_nano DESC, COALESCE(line_no, 0::UINTEGER) DESC, COALESCE(dedup_hash, 0::UBIGINT) DESC
         LIMIT ?{lim_idx}
         "#
     );
@@ -2882,5 +2880,295 @@ mod tests {
         let facets_bytes = facets_resp.into_body().collect().await.unwrap().to_bytes();
         let facets: LogFacetsResponse = serde_json::from_slice(&facets_bytes).unwrap();
         assert_eq!(facets.total_count, 650);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(miri, ignore)]
+    async fn test_logs_u64_max_tiebreak_and_legacy_cold_parquet_null_dedup_pagination() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use std::collections::HashSet;
+        use tempfile::tempdir;
+        use tower::ServiceExt;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("hot.duckdb");
+        let parquet_root = dir.path().join("parquet");
+        let store =
+            HotDuckDbStore::open(Some(&db_path), Some(&parquet_root)).expect("open disk store");
+
+        // 1. Hot rows sharing identical (timestamp_unix_nano, line_no = 42) with u64::MAX high-bit dedup_hashes
+        let hot_ts = 1_700_000_200_000_000_000i64;
+        let expected_hashes = [u64::MAX, u64::MAX - 1, (i64::MAX as u64) + 5, 100u64];
+        {
+            let conn = store.lock_conn().expect("lock conn");
+            for (idx, &dh) in expected_hashes.iter().enumerate() {
+                conn.execute(
+                    r#"
+                    INSERT INTO otel_logs (
+                        timestamp_unix_nano, trace_id, span_id, severity_number, severity_text,
+                        service_name, node_id, body, attributes_json, job_id, stage_id,
+                        line_no, stream, dedup_hash
+                    ) VALUES (?1, ?2, ?3, 9, 'INFO', 'tiebreak-svc', 'node-a', ?4, '{}', NULL, NULL, 42, 1, ?5)
+                    "#,
+                    duckdb::params![
+                        hot_ts,
+                        format!("tr-u64-{idx}"),
+                        format!("sp-u64-{idx}"),
+                        format!("highbit tiebreak row {idx}"),
+                        dh
+                    ],
+                )
+                .expect("insert u64 tiebreak row");
+            }
+        }
+
+        // 2. Legacy cold Parquet shard lacking dedup_hash / line_no / stream columns (all sharing ts & line_no = 0)
+        let cold_dir = parquet_root
+            .join("signal=logs")
+            .join("year=2026")
+            .join("month=01");
+        std::fs::create_dir_all(&cold_dir).expect("create cold dir");
+        let cold_file = cold_dir.join("legacy-no-dedup.parquet");
+        let cold_ts = 1_699_000_000_000_000_000i64;
+        {
+            let conn = store.lock_conn().expect("lock conn");
+            let escaped = cold_file.to_string_lossy().replace('\'', "''");
+            conn.execute_batch(&format!(
+                r#"
+                COPY (
+                    SELECT {cold_ts}::BIGINT AS timestamp_unix_nano,
+                           'tr-cold-' || CAST(i AS VARCHAR) AS trace_id,
+                           'sp-cold-' || CAST(i AS VARCHAR) AS span_id,
+                           9::INTEGER AS severity_number,
+                           'INFO'::VARCHAR AS severity_text,
+                           'legacy-cold-svc'::VARCHAR AS service_name,
+                           'node-a'::VARCHAR AS node_id,
+                           'legacy cold log #' || CAST(i AS VARCHAR) AS body,
+                           '{{"cold_attr":"cold-needle-' || CAST(i AS VARCHAR) || '"}}'::VARCHAR AS attributes_json,
+                           NULL::VARCHAR AS job_id,
+                           NULL::VARCHAR AS stage_id
+                    FROM range(5) t(i)
+                ) TO '{escaped}' (FORMAT PARQUET, COMPRESSION ZSTD);
+                "#
+            ))
+            .expect("write legacy cold parquet");
+            crate::storage::register_unified_views(&conn, Some(&parquet_root))
+                .expect("refresh v_logs");
+        }
+
+        let app = build_console_api_router(store);
+
+        // Page through all 9 logs (4 hot u64 tie-breaks + 5 cold NULL-dedup_hash rows) with limit=2
+        let mut cursor: Option<String> = None;
+        let mut seen_traces = Vec::new();
+        let mut seen_hashes = Vec::new();
+        loop {
+            let uri = match &cursor {
+                Some(c) => format!("/api/v1/logs?limit=2&before={c}"),
+                None => "/api/v1/logs?limit=2".to_string(),
+            };
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let parsed: LogsQueryResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed.total_matched, Some(9));
+            for item in &parsed.logs {
+                seen_traces.push(item.trace_id.clone());
+                seen_hashes.push(item.dedup_hash);
+            }
+            if !parsed.has_more {
+                break;
+            }
+            cursor = parsed.next_cursor;
+            assert!(cursor.is_some());
+        }
+        assert_eq!(seen_traces.len(), 9);
+        let unique_traces: HashSet<&String> = seen_traces.iter().collect();
+        assert_eq!(
+            unique_traces.len(),
+            9,
+            "must not skip or duplicate rows: {seen_traces:?}"
+        );
+        assert_eq!(&seen_hashes[..4], &expected_hashes);
+        assert!(
+            seen_hashes[4..].iter().all(|&h| h != 0),
+            "legacy cold Parquet rows must receive deterministic non-zero dedup_hash"
+        );
+
+        // Search inside attributes_json on cold Parquet rows
+        let attr_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/logs?q=cold-needle-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attr_resp.status(), StatusCode::OK);
+        let attr_bytes = attr_resp.into_body().collect().await.unwrap().to_bytes();
+        let attr_parsed: LogsQueryResponse = serde_json::from_slice(&attr_bytes).unwrap();
+        assert_eq!(attr_parsed.total, 1);
+        assert_eq!(attr_parsed.logs[0].trace_id, "tr-cold-3");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_facets_logs_parity_redacted_service_merge_and_oracle_zero_facets() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+        use mu_observable_ipc::OtelLogEntry;
+        use tower::ServiceExt;
+
+        let _env = crate::server::sanitize::ScopedAliasEnv::acquire_cleared();
+        std::env::set_var(
+            "MU_OBSERVABLE_HUB_HOSTNAME_ALIASES",
+            "raw-alpha:node-a,raw-beta:node-a",
+        );
+
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        let base_ts = 1_700_000_300_000_000_000i64;
+        store
+            .insert_logs(&[
+                OtelLogEntry {
+                    timestamp_unix_nano: base_ts,
+                    trace_id: "tr-p1".into(),
+                    span_id: "sp-p1".into(),
+                    severity_number: 9,
+                    severity_text: "INFO".into(),
+                    service_name: "svc.raw-alpha".into(),
+                    node_id: "raw-alpha".into(),
+                    body: "hello from alpha".into(),
+                    attributes_json: "{}".into(),
+                    job_id: None,
+                    stage_id: None,
+                },
+                OtelLogEntry {
+                    timestamp_unix_nano: base_ts + 1_000_000,
+                    trace_id: "tr-p2".into(),
+                    span_id: "sp-p2".into(),
+                    severity_number: 17,
+                    severity_text: "ERROR".into(),
+                    service_name: "svc.raw-beta".into(),
+                    node_id: "raw-beta".into(),
+                    body: "secret ghp_facetoracle999".into(),
+                    attributes_json: "{}".into(),
+                    job_id: None,
+                    stage_id: None,
+                },
+            ])
+            .expect("insert 2 logs");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        rt.block_on(async move {
+            let app = build_console_api_router(store);
+            // 1. Services facet redacts and merges svc.raw-alpha + svc.raw-beta -> svc.node-a (count 2)
+            let facets_resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/logs/facets")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(facets_resp.status(), StatusCode::OK);
+            let fb = facets_resp.into_body().collect().await.unwrap().to_bytes();
+            let facets: LogFacetsResponse = serde_json::from_slice(&fb).unwrap();
+            assert_eq!(facets.total_count, 2);
+            assert_eq!(facets.services.len(), 1);
+            assert_eq!(facets.services[0].name, "svc.node-a");
+            assert_eq!(facets.services[0].count, 2);
+
+            // 2. Public alias query matches both via /api/v1/logs and /api/v1/logs/facets
+            let logs_resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/logs?q=node-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(logs_resp.status(), StatusCode::OK);
+            let lb = logs_resp.into_body().collect().await.unwrap().to_bytes();
+            let logs_parsed: LogsQueryResponse = serde_json::from_slice(&lb).unwrap();
+            assert_eq!(logs_parsed.total_matched, Some(2));
+
+            let alias_facets = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/api/v1/logs/facets?q=node-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(alias_facets.status(), StatusCode::OK);
+            let afb = alias_facets.into_body().collect().await.unwrap().to_bytes();
+            let af: LogFacetsResponse = serde_json::from_slice(&afb).unwrap();
+            assert_eq!(af.total_count, 2);
+
+            // 3. Oracle probes return 0 logs & 0 facets
+            for oracle in ["raw-alpha", "ghp_facetoracle999"] {
+                let r_logs = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/api/v1/logs?q={oracle}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let r_lb = r_logs.into_body().collect().await.unwrap().to_bytes();
+                let r_lp: LogsQueryResponse = serde_json::from_slice(&r_lb).unwrap();
+                assert_eq!(r_lp.total_matched, Some(0));
+                assert!(r_lp.logs.is_empty());
+
+                let r_fac = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/api/v1/logs/facets?q={oracle}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let r_fb = r_fac.into_body().collect().await.unwrap().to_bytes();
+                let r_fp: LogFacetsResponse = serde_json::from_slice(&r_fb).unwrap();
+                assert_eq!(r_fp.total_count, 0);
+                assert!(r_fp.services.is_empty());
+                assert!(r_fp.levels.is_empty());
+                assert!(r_fp.histogram.is_empty());
+            }
+        });
     }
 }
