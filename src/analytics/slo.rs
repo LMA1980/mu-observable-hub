@@ -1,7 +1,9 @@
 use duckdb::params;
 use mu_observable_ipc::{CanarySloAssertionRequest, CanarySloAssertionResponse};
 
-use crate::analytics::exclusions::{is_batch_ci_execution_span, is_user_ci_failure_span};
+use crate::analytics::exclusions::{
+    is_batch_ci_execution_span, is_user_ci_failure_span, MonitoringExclusions,
+};
 use crate::error::MuObserveError;
 use crate::storage::hot_duckdb::HotDuckDbStore;
 
@@ -13,32 +15,31 @@ pub fn evaluate_canary_slo(
     req: &CanarySloAssertionRequest,
     now_unix_nano: Option<i64>,
 ) -> Result<CanarySloAssertionResponse, MuObserveError> {
+    let exclusions = MonitoringExclusions::resolve(store);
     let conn = store.lock_conn()?;
 
     let anchor_ts: i64 = match now_unix_nano {
         Some(ts) => ts,
         None => {
-            let max_log_ts: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(timestamp_unix_nano), 0) FROM v_logs WHERE service_name = ?1",
-                    params![req.service_name],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let max_span_ts: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(end_time_unix_nano), 0) FROM v_traces WHERE service_name = ?1",
-                    params![req.service_name],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
+            let max_log_ts = latest_monitored_ts(
+                &conn,
+                "SELECT timestamp_unix_nano, COALESCE(attributes_json, '') FROM v_logs WHERE service_name = ?1 ORDER BY timestamp_unix_nano DESC",
+                &req.service_name,
+                &exclusions,
+            );
+            let max_span_ts = latest_monitored_ts(
+                &conn,
+                "SELECT end_time_unix_nano, COALESCE(attributes_json, '') FROM v_traces WHERE service_name = ?1 ORDER BY end_time_unix_nano DESC",
+                &req.service_name,
+                &exclusions,
+            );
             max_log_ts.max(max_span_ts)
         }
     };
 
     let bake_secs = req.bake_window_secs.max(1);
     let bake_window_ns = (bake_secs as i64).saturating_mul(1_000_000_000);
-    let cutoff_ts = anchor_ts.saturating_sub(bake_window_ns);
+    let cutoff_ts = exclusions.apply_cutoff_floor(anchor_ts.saturating_sub(bake_window_ns));
     let node_filter = if req.node_id.trim().is_empty() {
         None
     } else {
@@ -46,23 +47,27 @@ pub fn evaluate_canary_slo(
     };
 
     // Count ERROR/FATAL logs (severity_number >= 17 or severity_text IN ('ERROR', 'FATAL'))
-    let error_log_count_i64: i64 = conn.query_row(
+    let error_log_count_i64 = count_monitored_matching_logs(
+        &conn,
         r#"
-        SELECT COUNT(*)
+        SELECT COALESCE(attributes_json, '')
         FROM v_logs
         WHERE service_name = ?1
           AND (?2 IS NULL OR node_id = ?2)
           AND timestamp_unix_nano >= ?3
           AND (severity_number >= 17 OR UPPER(severity_text) IN ('ERROR', 'FATAL', 'CRITICAL'))
         "#,
-        params![req.service_name, node_filter, cutoff_ts],
-        |r| r.get(0),
+        &req.service_name,
+        node_filter.as_deref(),
+        cutoff_ts,
+        &exclusions,
     )?;
 
     // Detect crash/panic telemetry from runtime daemon logs (excluding CI job stdout/stderr lines)
-    let crash_count_i64: i64 = conn.query_row(
+    let crash_count_i64 = count_monitored_matching_logs(
+        &conn,
         r#"
-        SELECT COUNT(*)
+        SELECT COALESCE(attributes_json, '')
         FROM v_logs
         WHERE service_name = ?1
           AND (?2 IS NULL OR node_id = ?2)
@@ -85,8 +90,10 @@ pub fn evaluate_canary_slo(
               )
           )
         "#,
-        params![req.service_name, node_filter, cutoff_ts],
-        |r| r.get(0),
+        &req.service_name,
+        node_filter.as_deref(),
+        cutoff_ts,
+        &exclusions,
     )?;
 
     // Gather interactive span durations in the bake window to compute p99 latency in milliseconds
@@ -115,6 +122,9 @@ pub fn evaluate_canary_slo(
     let mut error_spans = 0u32;
     for sr in span_rows {
         let (dur_ns, status, span_name, attrs_json) = sr?;
+        if exclusions.is_attributes_excluded_from_slo(&attrs_json) {
+            continue;
+        }
         if !is_batch_ci_execution_span(&span_name) {
             durations_ms.push((dur_ns.max(0) as f64) / 1_000_000.0);
         }
@@ -167,6 +177,50 @@ pub fn evaluate_canary_slo(
         taint_recommended,
         reason,
     })
+}
+
+fn latest_monitored_ts(
+    conn: &duckdb::Connection,
+    sql: &str,
+    service_name: &str,
+    exclusions: &MonitoringExclusions,
+) -> i64 {
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return 0;
+    };
+    let Ok(rows) = stmt.query_map(params![service_name], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    }) else {
+        return 0;
+    };
+    for (ts, attrs_json) in rows.flatten() {
+        if !exclusions.is_attributes_excluded_from_slo(&attrs_json) {
+            return ts;
+        }
+    }
+    0
+}
+
+fn count_monitored_matching_logs(
+    conn: &duckdb::Connection,
+    sql: &str,
+    service_name: &str,
+    node_filter: Option<&str>,
+    cutoff_ts: i64,
+    exclusions: &MonitoringExclusions,
+) -> Result<i64, MuObserveError> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![service_name, node_filter, cutoff_ts], |r| {
+        r.get::<_, String>(0)
+    })?;
+    let mut count = 0i64;
+    for row in rows {
+        let attrs_json = row?;
+        if !exclusions.is_attributes_excluded_from_slo(&attrs_json) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn compute_percentile(sorted_or_unsorted: &mut [f64], q: f64) -> f64 {

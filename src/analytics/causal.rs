@@ -161,6 +161,9 @@ pub fn compute_causal_problems_with_exclusions(
         let status: String = row.get(2)?;
         let span_name: String = row.get(3)?;
         let attrs_json: String = row.get(4)?;
+        if exclusions.is_attributes_excluded_from_slo(&attrs_json) {
+            continue;
+        }
 
         let entry = service_map.entry(svc).or_insert_with(|| ServiceStats {
             durations: Vec::new(),
@@ -252,7 +255,9 @@ pub fn compute_causal_problems_with_exclusions(
                         let tid: String = r.get(0).unwrap_or_default();
                         let sn: String = r.get(1).unwrap_or_default();
                         let attrs: String = r.get(2).unwrap_or_default();
-                        if !is_user_ci_failure_span(&sn, &attrs) {
+                        if !is_user_ci_failure_span(&sn, &attrs)
+                            && !exclusions.is_attributes_excluded_from_slo(&attrs)
+                        {
                             found = Some(tid);
                             break;
                         }
@@ -261,9 +266,9 @@ pub fn compute_causal_problems_with_exclusions(
                 found
             })
         } else {
-            conn.query_row(
+            conn.prepare(
                 r#"
-                SELECT trace_id
+                SELECT trace_id, COALESCE(attributes_json, '')
                 FROM v_traces
                 WHERE service_name = ?1
                   AND start_time_unix_nano >= ?2
@@ -271,19 +276,31 @@ pub fn compute_causal_problems_with_exclusions(
                       STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.pipeline.')
                       OR STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.stage.')
                   )
-                ORDER BY duration_ns DESC LIMIT 1
+                ORDER BY duration_ns DESC
                 "#,
-                params![service_name, cutoff_ts],
-                |r| r.get(0),
             )
             .ok()
+            .and_then(|mut s| {
+                let mut found = None;
+                if let Ok(mut qrows) = s.query(params![service_name, cutoff_ts]) {
+                    while let Ok(Some(r)) = qrows.next() {
+                        let tid: String = r.get(0).unwrap_or_default();
+                        let attrs: String = r.get(1).unwrap_or_default();
+                        if !exclusions.is_attributes_excluded_from_slo(&attrs) {
+                            found = Some(tid);
+                            break;
+                        }
+                    }
+                }
+                found
+            })
         };
 
         if let Some(trace_id) = trace_id_opt {
-            // Fetch all spans in this trace to assemble call tree and compute self-times
+            // Fetch all non-child/monitored spans in this trace to assemble call tree and compute self-times
             let mut span_stmt = conn.prepare(
                 r#"
-                SELECT span_id, parent_span_id, service_name, start_time_unix_nano, end_time_unix_nano, duration_ns, UPPER(status_code)
+                SELECT span_id, parent_span_id, service_name, start_time_unix_nano, end_time_unix_nano, duration_ns, UPPER(status_code), COALESCE(attributes_json, '')
                 FROM v_traces
                 WHERE trace_id = ?1
                 ORDER BY start_time_unix_nano ASC
@@ -293,10 +310,18 @@ pub fn compute_causal_problems_with_exclusions(
             let mut span_rows = span_stmt.query(params![trace_id])?;
             while let Some(r) = span_rows.next()? {
                 let raw_s: String = r.get(2)?;
+                let clean_s = redactor.redact_str(&raw_s);
+                let attrs_json: String = r.get(7)?;
+                if exclusions.is_service_excluded(&raw_s)
+                    || exclusions.is_service_excluded(&clean_s)
+                    || exclusions.is_attributes_excluded_from_slo(&attrs_json)
+                {
+                    continue;
+                }
                 span_nodes.push(TraceSpanNode {
                     span_id: r.get(0)?,
                     parent_span_id: r.get(1)?,
-                    service_name: redactor.redact_str(&raw_s),
+                    service_name: clean_s,
                     _start_time_unix_nano: r.get(3)?,
                     _end_time_unix_nano: r.get(4)?,
                     duration_ns: r.get::<_, i64>(5)?.max(0) as u64,
@@ -310,34 +335,48 @@ pub fn compute_causal_problems_with_exclusions(
             // Correlate with error logs from v_logs
             let mut root_err_msg: Option<String> = None;
             if let Some(ref s_id) = root_span_id {
-                root_err_msg = conn
-                    .query_row(
-                        r#"
-                        SELECT body
-                        FROM v_logs
-                        WHERE trace_id = ?1 AND span_id = ?2
-                          AND (severity_number >= 17 OR UPPER(severity_text) LIKE '%ERR%' OR UPPER(severity_text) LIKE '%FATAL%')
-                        ORDER BY timestamp_unix_nano DESC LIMIT 1
-                        "#,
-                        params![trace_id, s_id],
-                        |r| r.get(0),
-                    )
-                    .ok();
+                if let Ok(mut estmt) = conn.prepare(
+                    r#"
+                    SELECT body, COALESCE(attributes_json, '')
+                    FROM v_logs
+                    WHERE trace_id = ?1 AND span_id = ?2
+                      AND (severity_number >= 17 OR UPPER(severity_text) LIKE '%ERR%' OR UPPER(severity_text) LIKE '%FATAL%')
+                    ORDER BY timestamp_unix_nano DESC
+                    "#,
+                ) {
+                    if let Ok(mut erows) = estmt.query(params![trace_id, s_id]) {
+                        while let Ok(Some(r)) = erows.next() {
+                            let body: String = r.get(0).unwrap_or_default();
+                            let attrs: String = r.get(1).unwrap_or_default();
+                            if !exclusions.is_attributes_excluded_from_slo(&attrs) {
+                                root_err_msg = Some(body);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             if root_err_msg.is_none() {
-                root_err_msg = conn
-                    .query_row(
-                        r#"
-                        SELECT body
-                        FROM v_logs
-                        WHERE trace_id = ?1 AND service_name = ?2
-                          AND (severity_number >= 17 OR UPPER(severity_text) LIKE '%ERR%' OR UPPER(severity_text) LIKE '%FATAL%')
-                        ORDER BY timestamp_unix_nano DESC LIMIT 1
-                        "#,
-                        params![trace_id, root_service],
-                        |r| r.get(0),
-                    )
-                    .ok();
+                if let Ok(mut estmt) = conn.prepare(
+                    r#"
+                    SELECT body, COALESCE(attributes_json, '')
+                    FROM v_logs
+                    WHERE trace_id = ?1 AND service_name = ?2
+                      AND (severity_number >= 17 OR UPPER(severity_text) LIKE '%ERR%' OR UPPER(severity_text) LIKE '%FATAL%')
+                    ORDER BY timestamp_unix_nano DESC
+                    "#,
+                ) {
+                    if let Ok(mut erows) = estmt.query(params![trace_id, root_service]) {
+                        while let Ok(Some(r)) = erows.next() {
+                            let body: String = r.get(0).unwrap_or_default();
+                            let attrs: String = r.get(1).unwrap_or_default();
+                            if !exclusions.is_attributes_excluded_from_slo(&attrs) {
+                                root_err_msg = Some(body);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             let root_err_msg = root_err_msg.map(|m| redactor.redact_str(&m));

@@ -18,10 +18,10 @@ use http_body_util::BodyExt;
 use mu_auth::{RoleLeases, HEADER_FORWARDED_USER, HEADER_PROXY_SECRET};
 use mu_observable_hub::{
     build_console_api_router, build_console_api_router_with_auth, compute_causal_problems,
-    compute_smartscape_topology, evaluate_canary_slo, evaluate_deterministic_problems,
-    execute_guarded_sql, CausalProblemsFeedResponse, HotDuckDbStore, IngressEngine, McpServer,
-    MonitoringExclusions, MonitoringExclusionsStatus, MuAuthFolioVerifier, ObsAuthVerifier,
-    SmartscapeTopology,
+    compute_purepath_waterfall, compute_smartscape_topology, evaluate_canary_slo,
+    evaluate_deterministic_problems, execute_guarded_sql, CausalProblemsFeedResponse,
+    HotDuckDbStore, IngressEngine, McpServer, MonitoringExclusions, MonitoringExclusionsStatus,
+    MuAuthFolioVerifier, ObsAuthVerifier, SmartscapeTopology,
 };
 use mu_observable_ipc::{
     BenchmarkRunEntry, CanarySloAssertionRequest, CentralJobRecord, CentralSubmoduleSnapshot,
@@ -1638,4 +1638,368 @@ async fn test_failing_test_surfaces_in_problems_and_clears_immediately_when_fixe
     .await
     .expect("SSE problem_resolved timeout");
     assert!(resolved_frame.contains("event: problem_resolved"));
+}
+
+#[tokio::test]
+async fn test_child_ci_context_unregistered_repos_and_synthetic_nodes_filtered_from_fleet_slos() {
+    let _guard = ENV_LOCK.lock().await;
+    let _restore = EnvRestoreGuard::capture(&[
+        "MUOBSERVE_EXCLUDED_REPOS",
+        "MUOBSERVE_RETIRED_SERVICES",
+        "MUOBSERVE_MONITORING_SINCE_UNIX_NANO",
+    ]);
+    std::env::remove_var("MUOBSERVE_EXCLUDED_REPOS");
+    std::env::remove_var("MUOBSERVE_RETIRED_SERVICES");
+    std::env::remove_var("MUOBSERVE_MONITORING_SINCE_UNIX_NANO");
+
+    let store = HotDuckDbStore::open_in_memory().expect("open store");
+    let now_ts = 1_796_000_000_000_000_000i64;
+    let stale_ts = now_ts - 600_000_000_000; // 10 minutes ago
+
+    // Register active fleet repos in __ar_console_registry__
+    store
+        .upsert_ci_state_batch(
+            &[CentralJobRecord {
+                job_id: "job-real-ci".into(),
+                event_type: "push".into(),
+                repo_name: "LMA1980/mu-ci-worker".into(),
+                repo_key: "lma1980/mu-ci-worker".into(),
+                clone_url: "https://github.com/LMA1980/mu-ci-worker.git".into(),
+                commit_sha: "sha-real-1".into(),
+                ref_name: "refs/heads/main".into(),
+                branch_key: "main".into(),
+                sender: "LMA1980".into(),
+                queued_at_us: 1_795_999_000_000_000,
+                updated_at_us: 1_795_999_100_000_000,
+                status_state: "Completed".into(),
+                exit_code: Some(0),
+                duration_secs: Some(12),
+                quality_score: Some(100),
+                letter_grade: Some("A+".into()),
+                coverage_pct: Some(92.0),
+                benchmark_summary: None,
+                tests_passed: Some(10),
+                tests_total: Some(10),
+                advisories_count: Some(0),
+                clippy_warnings: Some(0),
+                record_json: "{}".into(),
+            }],
+            &[],
+            &[CentralSubmoduleSnapshot {
+                parent_repo_key: "__ar_console_registry__".into(),
+                branch_key: "console".into(),
+                submodule_key: "registry".into(),
+                submodule_path_key: "console".into(),
+                latest_active_job_id: Some("registry".into()),
+                latest_active_json: Some(
+                    r#"{"fabric_rev":15,"repos":{"LMA1980/mu-ci-worker":{},"LMA1980/mu-ci-controller":{}},"retired_repos":{}}"#
+                        .into(),
+                ),
+                latest_active_queued_us: Some(1_795_999_000_000_000),
+                latest_completed_job_id: None,
+                latest_completed_json: None,
+                latest_completed_queued_us: None,
+            }],
+        )
+        .unwrap();
+
+    // Canonical cluster hosts reporting fresh host-level daemon metrics in v_metrics
+    store
+        .insert_metrics_batch(&[
+            OtelMetricEntry {
+                timestamp_unix_nano: now_ts - 5_000_000_000,
+                service_name: "musentinel".into(),
+                node_id: "worker-riscv64".into(),
+                metric_name: "host.cpu.utilization".into(),
+                metric_unit: "pct".into(),
+                value_f64: 18.0,
+                arch: "riscv64gc".into(),
+                cpu_cluster: Some("X100".into()),
+                vlen_bits: Some(256),
+                memlock_used_bytes: None,
+                memlock_limit_bytes: None,
+                trace_id: None,
+                span_id: None,
+                attributes_json: "{}".into(),
+            },
+            OtelMetricEntry {
+                timestamp_unix_nano: now_ts - 5_000_000_000,
+                service_name: "mu-observable-sentinel".into(),
+                node_id: "node-a".into(),
+                metric_name: "host.memory.used_bytes".into(),
+                metric_unit: "bytes".into(),
+                value_f64: 1024.0,
+                arch: "x86_64".into(),
+                cpu_cluster: None,
+                vlen_bits: None,
+                memlock_used_bytes: None,
+                memlock_limit_bytes: None,
+                trace_id: None,
+                span_id: None,
+                attributes_json: "{}".into(),
+            },
+        ])
+        .unwrap();
+
+    // Parent CI stage span + child CI test spans (both execution_context and telemetry.context)
+    // plus trace-only synthetic fixture node_ids from stale test runs (>300s ago).
+    store
+        .insert_spans_batch(&[
+            OtelSpanEntry {
+                trace_id: "trace-ci-stage-parent".into(),
+                span_id: "span-parent-stage".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-riscv64".into(),
+                span_name: "ci.stage.test-check".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: now_ts - 2_000_000_000,
+                end_time_unix_nano: now_ts - 100_000_000,
+                duration_ns: 1_900_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: r#"{"job_id":"job-real-ci","stage_id":"test-check"}"#.into(),
+            },
+            OtelSpanEntry {
+                trace_id: "trace-ci-stage-parent".into(),
+                span_id: "span-child-err".into(),
+                parent_span_id: Some("span-parent-stage".into()),
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-riscv64".into(),
+                span_name: "stage.execute".into(),
+                span_kind: "INTERNAL".into(),
+                start_time_unix_nano: now_ts - 1_500_000_000,
+                end_time_unix_nano: now_ts - 500_000_000,
+                duration_ns: 1_000_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("negative test expected failure".into()),
+                attributes_json: r#"{"execution_context":"ci_stage_child","fixture_node_id":"test-node-m3","fixture_repo_name":"owner/test-repo","fixture_job_id":"j1","repo_name":"LMA1980/mu-ci-worker"}"#.into(),
+            },
+            OtelSpanEntry {
+                trace_id: "trace-ci-stage-parent".into(),
+                span_id: "span-grandchild-err".into(),
+                parent_span_id: Some("span-child-err".into()),
+                service_name: "synthetic-test-svc".into(),
+                node_id: "worker-riscv64".into(),
+                span_name: "rpc.call".into(),
+                span_kind: "CLIENT".into(),
+                start_time_unix_nano: now_ts - 1_400_000_000,
+                end_time_unix_nano: now_ts - 600_000_000,
+                duration_ns: 800_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("simulated downstream error".into()),
+                attributes_json: r#"{"telemetry.context":"ci_stage_child","fixture_node_id":"worker-n100-test","fixture_repo_name":"owner/test-repo","fixture_job_id":"j1"}"#.into(),
+            },
+            // Unregistered fixture repo span without execution_context and stale synthetic node_id
+            OtelSpanEntry {
+                trace_id: "trace-fixture-stale".into(),
+                span_id: "span-fixture-stale".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "bench-node-worker".into(),
+                span_name: "GET /test/fixture".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: stale_ts - 900_000_000,
+                end_time_unix_nano: stale_ts,
+                duration_ns: 900_000_000,
+                status_code: "ERROR".into(),
+                status_message: Some("synthetic repo error".into()),
+                attributes_json: r#"{"repo_name":"owner/test-repo"}"#.into(),
+            },
+            // Trace-only synthetic node_id (>300s stale)
+            OtelSpanEntry {
+                trace_id: "trace-only-synthetic-node".into(),
+                span_id: "span-only-synthetic-node".into(),
+                parent_span_id: None,
+                service_name: "mu-ci-controller".into(),
+                node_id: "test-worker".into(),
+                span_name: "GET /healthz".into(),
+                span_kind: "SERVER".into(),
+                start_time_unix_nano: stale_ts - 5_000_000,
+                end_time_unix_nano: stale_ts,
+                duration_ns: 5_000_000,
+                status_code: "OK".into(),
+                status_message: None,
+                attributes_json: "{}".into(),
+            },
+        ])
+        .unwrap();
+
+    // Child-context & unmonitored-repo ERROR/FATAL panic logs
+    store
+        .insert_logs_batch(&[
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 400_000_000,
+                trace_id: "trace-ci-stage-parent".into(),
+                span_id: "span-child-err".into(),
+                severity_number: 21,
+                severity_text: "FATAL".into(),
+                service_name: "mu-ci-worker".into(),
+                node_id: "worker-riscv64".into(),
+                body: "simulated panic in child CI unit test".into(),
+                attributes_json:
+                    r#"{"execution_context":"ci_stage_child","fixture_node_id":"test-node-m3"}"#
+                        .into(),
+                job_id: None,
+                stage_id: None,
+            },
+            OtelLogEntry {
+                timestamp_unix_nano: now_ts - 300_000_000,
+                trace_id: "trace-fixture-stale".into(),
+                span_id: "span-fixture-stale".into(),
+                severity_number: 17,
+                severity_text: "ERROR".into(),
+                service_name: "mu-ci-controller".into(),
+                node_id: "storage-node".into(),
+                body: "crash fixture log from unregistered repo".into(),
+                attributes_json: r#"{"repo_name":"owner/test-repo"}"#.into(),
+                job_id: None,
+                stage_id: None,
+            },
+        ])
+        .unwrap();
+
+    // Unregistered fixture repo failing test & regressed benchmark
+    store
+        .insert_test_runs_batch(&[TestCaseRunEntry {
+            job_id: "j1".into(),
+            repo_key: "owner/test-repo".into(),
+            branch_key: "main".into(),
+            commit_sha: "sha-fixture".into(),
+            crate_name: "fixture-crate".into(),
+            test_binary: "cargo-test".into(),
+            test_name: "test_fixture_failure".into(),
+            status: "failed".into(),
+            duration_ms: 4.0,
+            failure_summary: Some("synthetic failure".into()),
+            timestamp_unix_nano: now_ts - 100_000_000,
+            node_id: "test-node".into(),
+            arch: "x86_64".into(),
+        }])
+        .unwrap();
+    seed_bench_regression(&store, "owner/test-repo", "fixture-crate", now_ts);
+
+    // 1. Zero false PROB-CAUSAL-* problems
+    let causal = compute_causal_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert!(
+        causal.is_empty(),
+        "child CI context and unregistered fixture repos must yield 0 causal problems: {causal:?}"
+    );
+
+    // 2. Zero false PROB-HEARTBEAT-*, PROB-ERRORS-*, PROB-LATENCY-*, PROB-CANARY-*, PROB-TEST-*, PROB-BENCH-*
+    let det = evaluate_deterministic_problems(&store, 3600, Some(now_ts)).unwrap();
+    assert!(
+        det.problems.is_empty(),
+        "expected 0 deterministic problems, got: {:?}",
+        det.problems
+    );
+
+    // 3. Smartscape topology excludes synthetic service/host from child/unmonitored spans
+    let topo = compute_smartscape_topology(&store, 3600, Some(now_ts)).unwrap();
+    assert!(
+        !topo.services.iter().any(|s| s.name == "synthetic-test-svc"),
+        "child-context service must not enter Smartscape: {:?}",
+        topo.services
+    );
+    assert!(
+        !topo
+            .hosts
+            .iter()
+            .any(|h| h.name == "bench-node-worker" || h.name == "test-node-m3"),
+        "unmonitored fixture hosts must not enter Smartscape: {:?}",
+        topo.hosts
+    );
+    let worker_svc = topo
+        .services
+        .iter()
+        .find(|s| s.name == "mu-ci-worker")
+        .expect("parent mu-ci-worker present");
+    assert_eq!(worker_svc.error_count, 0);
+    assert_eq!(worker_svc.health_state, "healthy");
+
+    // 4. Canary SLO passes (ignores child-context & unregistered-repo errors/panics)
+    let slo_worker = evaluate_canary_slo(
+        &store,
+        &CanarySloAssertionRequest {
+            request_id: "slo-child-ci".into(),
+            service_name: "mu-ci-worker".into(),
+            candidate_digest: "sha256:worker".into(),
+            node_id: "worker-riscv64".into(),
+            bake_window_secs: 60,
+            max_error_logs: 0,
+            max_p99_latency_ms: 100.0,
+        },
+        Some(now_ts),
+    )
+    .unwrap();
+    assert!(
+        slo_worker.healthy,
+        "unexpected SLO breach: {}",
+        slo_worker.reason
+    );
+    assert!(!slo_worker.taint_recommended);
+
+    let slo_ctrl = evaluate_canary_slo(
+        &store,
+        &CanarySloAssertionRequest {
+            request_id: "slo-unreg-repo".into(),
+            service_name: "mu-ci-controller".into(),
+            candidate_digest: "sha256:ctrl".into(),
+            node_id: String::new(),
+            bake_window_secs: 3600,
+            max_error_logs: 0,
+            max_p99_latency_ms: 100.0,
+        },
+        Some(now_ts),
+    )
+    .unwrap();
+    assert!(
+        slo_ctrl.healthy,
+        "unexpected SLO breach: {}",
+        slo_ctrl.reason
+    );
+
+    // 5. PurePath waterfall preserves full W3C hierarchy and fixture attributes
+    let pp = compute_purepath_waterfall(&store, "trace-ci-stage-parent")
+        .unwrap()
+        .expect("PurePath waterfall exists");
+    assert_eq!(pp.span_count, 3);
+    let child_node = pp
+        .spans
+        .iter()
+        .find(|s| s.span_id == "span-child-err")
+        .expect("child span rendered");
+    assert_eq!(child_node.depth, 1);
+    assert_eq!(
+        child_node.parent_span_id.as_deref(),
+        Some("span-parent-stage")
+    );
+    assert_eq!(
+        child_node.attributes["fixture_node_id"],
+        json!("test-node-m3")
+    );
+    assert_eq!(
+        child_node.attributes["fixture_repo_name"],
+        json!("owner/test-repo")
+    );
+    assert_eq!(child_node.attributes["fixture_job_id"], json!("j1"));
+
+    let grandchild_node = pp
+        .spans
+        .iter()
+        .find(|s| s.span_id == "span-grandchild-err")
+        .expect("grandchild span rendered");
+    assert_eq!(grandchild_node.depth, 2);
+    assert_eq!(
+        grandchild_node.attributes["fixture_node_id"],
+        json!("worker-n100-test")
+    );
+
+    // 6. 100% telemetry row retention verified across all DuckDB views
+    assert_eq!(store.count_rows("v_traces").unwrap(), 5);
+    assert_eq!(store.count_rows("v_logs").unwrap(), 2);
+    assert_eq!(store.count_rows("v_metrics").unwrap(), 2);
+    assert_eq!(store.count_rows("v_tests").unwrap(), 1);
+    assert_eq!(store.count_rows("v_benchmarks").unwrap(), 6);
+    assert_eq!(store.count_rows("v_jobs_history").unwrap(), 1);
 }
