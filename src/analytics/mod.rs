@@ -11,12 +11,12 @@ pub use causal::{
     CausalProblemsFeedResponse,
 };
 pub use exclusions::{
-    is_batch_ci_execution_span, is_ci_regression_problem_category, is_user_ci_failure_span,
-    MonitoringExclusions, MonitoringExclusionsStatus, MonitoringExclusionsUpdateRequest,
-    PersistedMonitoringExclusions, CONSOLE_REGISTRY_BRANCH_KEY, CONSOLE_REGISTRY_REPO_KEY,
-    CONSOLE_REGISTRY_SUBMODULE_KEY, ENV_EXCLUDED_REPOS, ENV_MONITORING_SINCE_UNIX_NANO,
-    ENV_RETIRED_SERVICES, MONITORING_EXCLUSIONS_BRANCH_KEY, MONITORING_EXCLUSIONS_REPO_KEY,
-    MONITORING_EXCLUSIONS_SUBMODULE_KEY,
+    is_batch_ci_execution_span, is_child_ci_context_attributes, is_ci_regression_problem_category,
+    is_user_ci_failure_span, MonitoringExclusions, MonitoringExclusionsStatus,
+    MonitoringExclusionsUpdateRequest, PersistedMonitoringExclusions, CONSOLE_REGISTRY_BRANCH_KEY,
+    CONSOLE_REGISTRY_REPO_KEY, CONSOLE_REGISTRY_SUBMODULE_KEY, ENV_EXCLUDED_REPOS,
+    ENV_MONITORING_SINCE_UNIX_NANO, ENV_RETIRED_SERVICES, MONITORING_EXCLUSIONS_BRANCH_KEY,
+    MONITORING_EXCLUSIONS_REPO_KEY, MONITORING_EXCLUSIONS_SUBMODULE_KEY,
 };
 pub use purepath::{
     compute_purepath_waterfall, list_trace_summaries, PurePathLogEntry, PurePathMetricEntry,

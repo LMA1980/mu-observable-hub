@@ -32,6 +32,25 @@ pub const ENV_RETIRED_SERVICES: &str = "MUOBSERVE_RETIRED_SERVICES";
 /// `cutoff_ts = cutoff_ts.max(monitoring_since_ns)` in active monitoring queries.
 pub const ENV_MONITORING_SINCE_UNIX_NANO: &str = "MUOBSERVE_MONITORING_SINCE_UNIX_NANO";
 
+/// Returns `true` when `attributes_json` carries child CI execution context markers
+/// (`"execution_context":"ci_stage_child"` or `"telemetry.context":"ci_stage_child"`).
+#[must_use]
+pub fn is_child_ci_context_attributes(attributes_json: &str) -> bool {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(attributes_json) else {
+        return false;
+    };
+    let is_child = |val: Option<&Value>| -> bool {
+        val.and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("ci_stage_child"))
+    };
+    if is_child(map.get("execution_context")) || is_child(map.get("telemetry.context")) {
+        return true;
+    }
+    map.get("telemetry")
+        .and_then(Value::as_object)
+        .is_some_and(|nested| is_child(nested.get("context")))
+}
+
 /// Returns `true` when `span_name` identifies a batch CI pipeline or stage execution span
 /// (`ci.pipeline.*` or `ci.stage.*`, case-insensitive after trimming).
 ///
@@ -143,6 +162,8 @@ pub struct MonitoringExclusionsUpdateRequest {
 pub struct MonitoringExclusionsStatus {
     pub excluded_repos: BTreeSet<String>,
     pub retired_services: BTreeSet<String>,
+    #[serde(default)]
+    pub registered_repos: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitoring_since_unix_nano: Option<i64>,
     pub registry_retired_repos: BTreeSet<String>,
@@ -158,6 +179,8 @@ pub struct MonitoringExclusionsStatus {
 pub struct MonitoringExclusions {
     pub excluded_repos: BTreeSet<String>,
     pub retired_services: BTreeSet<String>,
+    #[serde(default)]
+    pub registered_repos: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monitoring_since_unix_nano: Option<i64>,
 }
@@ -204,6 +227,7 @@ impl MonitoringExclusions {
         Self {
             excluded_repos,
             retired_services,
+            registered_repos: BTreeSet::new(),
             monitoring_since_unix_nano,
         }
     }
@@ -231,16 +255,14 @@ impl MonitoringExclusions {
         Self::parse_from_env_values(repos.as_deref(), services.as_deref(), since.as_deref())
     }
 
-    /// Extracts normalized `retired_repos` keys from a serialized `__ar_console_registry__` payload.
-    #[must_use]
-    pub fn parse_registry_retired_repos_json(raw_json: &str) -> BTreeSet<String> {
+    fn parse_registry_repo_set_json(raw_json: &str, field: &str) -> BTreeSet<String> {
         let Ok(val) = serde_json::from_str::<Value>(raw_json) else {
             return BTreeSet::new();
         };
-        let Some(retired) = val.get("retired_repos") else {
+        let Some(target) = val.get(field) else {
             return BTreeSet::new();
         };
-        match retired {
+        match target {
             Value::Object(map) => map
                 .keys()
                 .map(|k| k.trim().to_ascii_lowercase())
@@ -256,9 +278,19 @@ impl MonitoringExclusions {
         }
     }
 
-    /// Dynamically reads `retired_repos` keys persisted in `__ar_console_registry__`.
+    /// Extracts normalized `retired_repos` keys from a serialized `__ar_console_registry__` payload.
     #[must_use]
-    pub fn load_registry_retired_repos(store: &HotDuckDbStore) -> BTreeSet<String> {
+    pub fn parse_registry_retired_repos_json(raw_json: &str) -> BTreeSet<String> {
+        Self::parse_registry_repo_set_json(raw_json, "retired_repos")
+    }
+
+    /// Extracts normalized active `repos` keys from a serialized `__ar_console_registry__` payload.
+    #[must_use]
+    pub fn parse_registry_registered_repos_json(raw_json: &str) -> BTreeSet<String> {
+        Self::parse_registry_repo_set_json(raw_json, "repos")
+    }
+
+    fn load_registry_repos(store: &HotDuckDbStore) -> (BTreeSet<String>, BTreeSet<String>) {
         let req = QuerySubmoduleSnapshotsRequest {
             request_id: "monitoring-exclusions-registry".to_string(),
             parent_repo_key: Some(CONSOLE_REGISTRY_REPO_KEY.to_string()),
@@ -266,19 +298,33 @@ impl MonitoringExclusions {
             branch_key: Some(CONSOLE_REGISTRY_BRANCH_KEY.to_string()),
         };
         let Ok(rows) = store.query_submodule_snapshots(&req) else {
-            return BTreeSet::new();
+            return (BTreeSet::new(), BTreeSet::new());
         };
-        let mut out = BTreeSet::new();
+        let mut registered = BTreeSet::new();
+        let mut retired = BTreeSet::new();
         for snap in rows {
             if let Some(json_str) = snap
                 .latest_active_json
                 .as_deref()
                 .or(snap.latest_completed_json.as_deref())
             {
-                out.extend(Self::parse_registry_retired_repos_json(json_str));
+                registered.extend(Self::parse_registry_registered_repos_json(json_str));
+                retired.extend(Self::parse_registry_retired_repos_json(json_str));
             }
         }
-        out
+        (registered, retired)
+    }
+
+    /// Dynamically reads `retired_repos` keys persisted in `__ar_console_registry__`.
+    #[must_use]
+    pub fn load_registry_retired_repos(store: &HotDuckDbStore) -> BTreeSet<String> {
+        Self::load_registry_repos(store).1
+    }
+
+    /// Dynamically reads active `repos` keys persisted in `__ar_console_registry__`.
+    #[must_use]
+    pub fn load_registry_registered_repos(store: &HotDuckDbStore) -> BTreeSet<String> {
+        Self::load_registry_repos(store).0
     }
 
     /// Loads operator-persisted exclusions from `__muobserve_monitoring_exclusions__`.
@@ -402,7 +448,7 @@ impl MonitoringExclusions {
     #[must_use]
     pub fn resolve_status(store: &HotDuckDbStore) -> MonitoringExclusionsStatus {
         let env = Self::from_env();
-        let registry_retired_repos = Self::load_registry_retired_repos(store);
+        let (registered_repos, registry_retired_repos) = Self::load_registry_repos(store);
         let persisted = Self::load_persisted(store);
 
         let mut excluded_repos = env.excluded_repos.clone();
@@ -424,6 +470,7 @@ impl MonitoringExclusions {
         MonitoringExclusionsStatus {
             excluded_repos,
             retired_services,
+            registered_repos,
             monitoring_since_unix_nano,
             registry_retired_repos,
             env_excluded_repos: env.excluded_repos,
@@ -434,13 +481,14 @@ impl MonitoringExclusions {
     }
 
     /// Resolves the effective [`MonitoringExclusions`] from environment variables,
-    /// `__ar_console_registry__` `retired_repos`, and `__muobserve_monitoring_exclusions__`.
+    /// `__ar_console_registry__` `repos` & `retired_repos`, and `__muobserve_monitoring_exclusions__`.
     #[must_use]
     pub fn resolve(store: &HotDuckDbStore) -> Self {
         let status = Self::resolve_status(store);
         Self {
             excluded_repos: status.excluded_repos,
             retired_services: status.retired_services,
+            registered_repos: status.registered_repos,
             monitoring_since_unix_nano: status.monitoring_since_unix_nano,
         }
     }
@@ -450,6 +498,7 @@ impl MonitoringExclusions {
     pub fn is_empty(&self) -> bool {
         self.excluded_repos.is_empty()
             && self.retired_services.is_empty()
+            && self.registered_repos.is_empty()
             && self.monitoring_since_unix_nano.is_none()
     }
 
@@ -470,6 +519,46 @@ impl MonitoringExclusions {
         self.excluded_repos
             .iter()
             .any(|entry| entry.rsplit_once('/').is_some_and(|(_, s)| s == norm))
+    }
+
+    /// Returns `true` when `repo_key` is actively monitored (`!is_repo_excluded(repo_key)` and,
+    /// when `registered_repos` is non-empty, present in `registered_repos`).
+    #[must_use]
+    pub fn is_repo_monitored(&self, repo_key: &str) -> bool {
+        let norm = repo_key.trim().to_ascii_lowercase();
+        if norm.is_empty() || self.is_repo_excluded(&norm) {
+            return false;
+        }
+        if self.registered_repos.is_empty() {
+            return true;
+        }
+        self.registered_repos.contains(&norm)
+    }
+
+    /// Extracts the normalized repository name (`repo_name` or `repo_key`) from `attributes_json`,
+    /// if present and non-empty.
+    #[must_use]
+    pub fn extract_attributes_repo_name(attributes_json: &str) -> Option<String> {
+        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(attributes_json) else {
+            return None;
+        };
+        map.get("repo_name")
+            .or_else(|| map.get("repo_key"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+    }
+
+    /// Returns `true` when telemetry attributes carry a child CI execution context marker or
+    /// reference a repository that is not monitored (`!is_repo_monitored`).
+    #[must_use]
+    pub fn is_attributes_excluded_from_slo(&self, attributes_json: &str) -> bool {
+        if is_child_ci_context_attributes(attributes_json) {
+            return true;
+        }
+        Self::extract_attributes_repo_name(attributes_json)
+            .is_some_and(|repo| !self.is_repo_monitored(&repo))
     }
 
     /// Returns `true` when `service_name` (case-insensitive) is in `retired_services`.
@@ -688,5 +777,83 @@ mod tests {
             "ci.pipeline.run:LMA1980/jero-core",
             r#"{"job_id":"j1","repo":"LMA1980/jero-core"}"#
         ));
+    }
+
+    #[test]
+    fn test_is_child_ci_context_attributes_and_is_repo_monitored() {
+        assert!(is_child_ci_context_attributes(
+            r#"{"execution_context":"ci_stage_child","fixture_node_id":"test-node-m3"}"#
+        ));
+        assert!(is_child_ci_context_attributes(
+            r#"{"telemetry.context": "ci_stage_child"}"#
+        ));
+        assert!(is_child_ci_context_attributes(
+            r#"{"telemetry":{"context":"CI_STAGE_CHILD"}}"#
+        ));
+        assert!(!is_child_ci_context_attributes(
+            r#"{"execution_context":"daemon"}"#
+        ));
+        assert!(!is_child_ci_context_attributes("{}"));
+        assert!(!is_child_ci_context_attributes("not-json"));
+
+        // When registered_repos is empty, all non-excluded non-empty repos are monitored.
+        let env_only =
+            MonitoringExclusions::parse_from_env_values(Some("lma1980/retired-repo"), None, None);
+        assert!(env_only.is_repo_monitored("LMA1980/mu-ci-worker"));
+        assert!(!env_only.is_repo_monitored("lma1980/retired-repo"));
+        assert!(!env_only.is_repo_monitored(""));
+
+        // When registered_repos is non-empty, only registered & non-excluded repos are monitored.
+        let mut with_reg = env_only.clone();
+        with_reg
+            .registered_repos
+            .insert("lma1980/mu-ci-worker".into());
+        with_reg
+            .registered_repos
+            .insert("lma1980/retired-repo".into());
+        assert!(with_reg.is_repo_monitored("LMA1980/mu-ci-worker"));
+        assert!(!with_reg.is_repo_monitored("owner/test-repo"));
+        assert!(!with_reg.is_repo_monitored("lma1980/retired-repo"));
+
+        assert!(with_reg.is_attributes_excluded_from_slo(
+            r#"{"execution_context":"ci_stage_child","repo_name":"LMA1980/mu-ci-worker"}"#
+        ));
+        assert!(with_reg.is_attributes_excluded_from_slo(r#"{"repo_name":"owner/test-repo"}"#));
+        assert!(
+            !with_reg.is_attributes_excluded_from_slo(r#"{"repo_name":"LMA1980/mu-ci-worker"}"#)
+        );
+        assert!(!with_reg.is_attributes_excluded_from_slo(r#"{"domain":"daemon"}"#));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_resolve_loads_registered_repos_from_console_registry() {
+        let store = HotDuckDbStore::open_in_memory().expect("open store");
+        store
+            .upsert_submodule_snapshots(&[CentralSubmoduleSnapshot {
+                parent_repo_key: CONSOLE_REGISTRY_REPO_KEY.into(),
+                branch_key: CONSOLE_REGISTRY_BRANCH_KEY.into(),
+                submodule_key: CONSOLE_REGISTRY_SUBMODULE_KEY.into(),
+                submodule_path_key: CONSOLE_REGISTRY_BRANCH_KEY.into(),
+                latest_active_job_id: Some("registry".into()),
+                latest_active_json: Some(
+                    r#"{"fabric_rev":14,"repos":{"LMA1980/mu-ci-worker":{},"LMA1980/mu-observable-hub":{}},"retired_repos":{"LMA1980/k3-core":"2026-11-17T00:00:00Z"}}"#
+                        .into(),
+                ),
+                latest_active_queued_us: Some(1_700_000_000_000_000),
+                latest_completed_job_id: None,
+                latest_completed_json: None,
+                latest_completed_queued_us: None,
+            }])
+            .expect("upsert console registry snapshot");
+
+        let resolved = MonitoringExclusions::resolve(&store);
+        assert!(resolved.registered_repos.contains("lma1980/mu-ci-worker"));
+        assert!(resolved
+            .registered_repos
+            .contains("lma1980/mu-observable-hub"));
+        assert!(resolved.is_repo_monitored("LMA1980/mu-ci-worker"));
+        assert!(!resolved.is_repo_monitored("owner/test-repo"));
+        assert!(!resolved.is_repo_monitored("lma1980/k3-core"));
     }
 }

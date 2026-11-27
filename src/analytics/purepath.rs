@@ -946,4 +946,81 @@ mod tests {
         assert!(!payload_json.contains("ghp_abc123456"));
         assert!(!payload_json.contains("/var/lib/"));
     }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_purepath_preserves_child_ci_spans_and_fixture_attributes() {
+        let store = HotDuckDbStore::open_in_memory().expect("open in memory");
+        let base_ts = 1_700_000_000_000_000_000i64;
+
+        store
+            .insert_spans_batch(&[
+                OtelSpanEntry {
+                    trace_id: "trace-ci-child-tree".into(),
+                    span_id: "span-parent-stage".into(),
+                    parent_span_id: None,
+                    service_name: "mu-ci-worker".into(),
+                    node_id: "worker-riscv64".into(),
+                    span_name: "ci.stage.test-check".into(),
+                    span_kind: "INTERNAL".into(),
+                    start_time_unix_nano: base_ts,
+                    end_time_unix_nano: base_ts + 500_000_000,
+                    duration_ns: 500_000_000,
+                    status_code: "OK".into(),
+                    status_message: None,
+                    attributes_json: r#"{"job_id":"job-real-1","stage_id":"test-check"}"#.into(),
+                },
+                OtelSpanEntry {
+                    trace_id: "trace-ci-child-tree".into(),
+                    span_id: "span-child-test".into(),
+                    parent_span_id: Some("span-parent-stage".into()),
+                    service_name: "mu-ci-worker".into(),
+                    node_id: "worker-riscv64".into(),
+                    span_name: "stage.execute".into(),
+                    span_kind: "INTERNAL".into(),
+                    start_time_unix_nano: base_ts + 50_000_000,
+                    end_time_unix_nano: base_ts + 250_000_000,
+                    duration_ns: 200_000_000,
+                    status_code: "ERROR".into(),
+                    status_message: Some("negative fixture assertion".into()),
+                    attributes_json: r#"{"execution_context":"ci_stage_child","fixture_node_id":"test-node-m3","fixture_repo_name":"owner/test-repo","fixture_job_id":"j1"}"#.into(),
+                },
+            ])
+            .unwrap();
+
+        let pp = compute_purepath_waterfall(&store, "trace-ci-child-tree")
+            .unwrap()
+            .expect("trace exists");
+        assert_eq!(pp.span_count, 2);
+        let parent = pp
+            .spans
+            .iter()
+            .find(|s| s.span_id == "span-parent-stage")
+            .unwrap();
+        assert_eq!(parent.depth, 0);
+
+        let child = pp
+            .spans
+            .iter()
+            .find(|s| s.span_id == "span-child-test")
+            .unwrap();
+        assert_eq!(child.depth, 1);
+        assert_eq!(child.parent_span_id.as_deref(), Some("span-parent-stage"));
+        assert_eq!(
+            child.attributes["execution_context"],
+            Value::String("ci_stage_child".into())
+        );
+        assert_eq!(
+            child.attributes["fixture_node_id"],
+            Value::String("test-node-m3".into())
+        );
+        assert_eq!(
+            child.attributes["fixture_repo_name"],
+            Value::String("owner/test-repo".into())
+        );
+        assert_eq!(
+            child.attributes["fixture_job_id"],
+            Value::String("j1".into())
+        );
+    }
 }

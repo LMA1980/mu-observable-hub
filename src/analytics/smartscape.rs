@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use duckdb::params;
 use serde::{Deserialize, Serialize};
@@ -244,8 +244,10 @@ pub fn compute_smartscape_topology_with_exclusions(
         let span_name: String = r.get(7)?;
         let attrs_json: String = r.get(8)?;
         let clean_svc = redactor.redact_str(&raw_svc);
+        let is_attr_excluded = exclusions.is_attributes_excluded_from_slo(&attrs_json);
         Ok((
             raw_svc,
+            is_attr_excluded,
             SpanRow {
                 trace_id: r.get(0)?,
                 span_id: r.get(1)?,
@@ -262,9 +264,10 @@ pub fn compute_smartscape_topology_with_exclusions(
 
     let mut all_spans = Vec::new();
     for r in rows {
-        let (raw_svc, sp) = r?;
+        let (raw_svc, is_attr_excluded, sp) = r?;
         if exclusions.is_service_excluded(&raw_svc)
             || exclusions.is_service_excluded(&sp.service_name)
+            || is_attr_excluded
         {
             continue;
         }
@@ -276,7 +279,7 @@ pub fn compute_smartscape_topology_with_exclusions(
     let mut host_meta: BTreeMap<String, (String, Option<String>, Option<u32>)> = BTreeMap::new();
     if let Ok(mut m_stmt) = conn.prepare(
         r#"
-        SELECT node_id, arch, cpu_cluster, vlen_bits
+        SELECT node_id, arch, cpu_cluster, vlen_bits, service_name, COALESCE(attributes_json, '')
         FROM v_metrics
         ORDER BY timestamp_unix_nano DESC
         LIMIT 500
@@ -287,14 +290,25 @@ pub fn compute_smartscape_topology_with_exclusions(
             let arch: String = r.get(1)?;
             let cluster: Option<String> = r.get(2)?;
             let vlen: Option<i32> = r.get(3)?;
+            let raw_svc: String = r.get(4)?;
+            let attrs_json: String = r.get(5)?;
             Ok((
                 redactor.redact_host(&raw_node),
                 arch,
                 cluster,
                 vlen.map(|v| v.max(0) as u32),
+                raw_svc,
+                attrs_json,
             ))
         }) {
             for mr in m_rows.flatten() {
+                let clean_svc = redactor.redact_str(&mr.4);
+                if exclusions.is_service_excluded(&mr.4)
+                    || exclusions.is_service_excluded(&clean_svc)
+                    || exclusions.is_attributes_excluded_from_slo(&mr.5)
+                {
+                    continue;
+                }
                 host_meta.entry(mr.0).or_insert((mr.1, mr.2, mr.3));
             }
         }
@@ -553,7 +567,8 @@ pub fn evaluate_deterministic_problems_with_exclusions(
     // 1 & 2. Evaluate Latency p95 breach (> 250 ms) and Error rate breach (> 5%) per service
     for svc in &topology.services {
         if svc.p95_latency_ms > 250.0 {
-            let root_trace = find_slowest_trace_for_service(&conn, &svc.name, cutoff_ts);
+            let root_trace =
+                find_slowest_trace_for_service(&conn, &svc.name, cutoff_ts, exclusions);
             problems.push(ProblemCard {
                 problem_id: format!("PROB-LATENCY-{}", svc.name),
                 title: format!("SLO Latency p95 Breach on {}", svc.name),
@@ -583,8 +598,10 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }
 
         if svc.error_rate_pct > 5.0 || svc.error_count > 0 {
-            let root_trace = find_error_trace_for_service(&conn, &svc.name, cutoff_ts)
-                .or_else(|| find_slowest_trace_for_service(&conn, &svc.name, cutoff_ts));
+            let root_trace = find_error_trace_for_service(&conn, &svc.name, cutoff_ts, exclusions)
+                .or_else(|| {
+                    find_slowest_trace_for_service(&conn, &svc.name, cutoff_ts, exclusions)
+                });
             problems.push(ProblemCard {
                 problem_id: format!("PROB-ERRORS-{}", svc.name),
                 title: format!("SLO Error Rate Breach on {}", svc.name),
@@ -614,10 +631,11 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }
     }
 
-    // 3. Evaluate Canary Taint / Crash Telemetry from runtime v_logs (excluding CI job console output)
+    // 3. Evaluate Canary Taint / Crash Telemetry from runtime v_logs (excluding CI job console output
+    // and child CI / unmonitored fixture telemetry)
     if let Ok(mut crash_stmt) = conn.prepare(
         r#"
-        SELECT service_name, trace_id, body, timestamp_unix_nano
+        SELECT service_name, trace_id, body, timestamp_unix_nano, COALESCE(attributes_json, '')
         FROM v_logs
         WHERE timestamp_unix_nano >= ?1
           AND COALESCE(job_id, '') = ''
@@ -639,7 +657,7 @@ pub fn evaluate_deterministic_problems_with_exclusions(
               )
           )
         ORDER BY timestamp_unix_nano DESC
-        LIMIT 20
+        LIMIT 50
         "#,
     ) {
         let mut seen_canary_svcs = BTreeMap::new();
@@ -649,12 +667,14 @@ pub fn evaluate_deterministic_problems_with_exclusions(
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
             ))
         }) {
             for row in rows.flatten() {
                 let clean_svc = redactor.redact_str(&row.0);
                 if exclusions.is_service_excluded(&row.0)
                     || exclusions.is_service_excluded(&clean_svc)
+                    || exclusions.is_attributes_excluded_from_slo(&row.4)
                 {
                     continue;
                 }
@@ -667,7 +687,7 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         for (svc_name, (trace_id, body, ts_ns)) in seen_canary_svcs {
             let clean_body = redactor.redact_str(&body);
             let trace_opt = if trace_id.trim().is_empty() {
-                find_slowest_trace_for_service(&conn, &svc_name, cutoff_ts)
+                find_slowest_trace_for_service(&conn, &svc_name, cutoff_ts, exclusions)
             } else {
                 Some(trace_id)
             };
@@ -690,93 +710,140 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }
     }
 
-    // 4. Evaluate Heartbeat Staleness across nodes when anchor_ts > 0 using traces, metrics, and logs
+    // 4. Evaluate Heartbeat Staleness across canonical cluster hosts (nodes reporting host-level
+    // daemon metrics in v_metrics, excluding child-context spans and trace-only fixture nodes)
     if anchor_ts > 0 {
         let staleness_threshold_ns: i64 = 300_000_000_000; // 5 minutes
-        if let Ok(mut hb_stmt) = conn.prepare(
+        let mut canonical_hosts = BTreeSet::new();
+        if let Ok(mut ch_stmt) = conn.prepare(
             r#"
-            SELECT node_id, service_name, MAX(ts_ns) AS last_seen_ns
-            FROM (
-                SELECT node_id, service_name, end_time_unix_nano AS ts_ns
-                FROM v_traces
-                WHERE (?1 IS NULL OR end_time_unix_nano >= ?1)
-                  AND TRIM(node_id) != ''
-                UNION ALL
-                SELECT node_id, service_name, timestamp_unix_nano AS ts_ns
-                FROM v_metrics
-                WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
-                  AND TRIM(node_id) != ''
-                UNION ALL
-                SELECT node_id, service_name, timestamp_unix_nano AS ts_ns
-                FROM v_logs
-                WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
-                  AND TRIM(node_id) != ''
-            )
-            GROUP BY node_id, service_name
+            SELECT node_id, service_name, metric_name, COALESCE(attributes_json, '')
+            FROM v_metrics
+            WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+              AND TRIM(node_id) != ''
             "#,
         ) {
-            if let Ok(rows) =
-                hb_stmt.query_map(params![exclusions.monitoring_since_unix_nano], |r| {
+            if let Ok(ch_rows) =
+                ch_stmt.query_map(params![exclusions.monitoring_since_unix_nano], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
                     ))
                 })
             {
-                let mut node_last_seen: BTreeMap<String, (String, i64)> = BTreeMap::new();
-                for (raw_node, raw_svc, last_seen_ns) in rows.flatten() {
+                for (raw_node, raw_svc, metric_name, attrs_json) in ch_rows.flatten() {
                     let clean_svc = redactor.redact_str(&raw_svc);
                     if exclusions.is_service_excluded(&raw_svc)
                         || exclusions.is_service_excluded(&clean_svc)
+                        || exclusions.is_attributes_excluded_from_slo(&attrs_json)
+                    {
+                        continue;
+                    }
+                    if !is_host_daemon_metric(&raw_svc, &metric_name)
+                        && !is_host_daemon_metric(&clean_svc, &metric_name)
                     {
                         continue;
                     }
                     let clean_node = redactor.redact_host(&raw_node);
-                    if clean_node.trim().is_empty() || clean_node.eq_ignore_ascii_case("controller")
+                    if !clean_node.trim().is_empty()
+                        && !clean_node.eq_ignore_ascii_case("controller")
                     {
-                        continue;
+                        canonical_hosts.insert(clean_node);
                     }
-                    node_last_seen
-                        .entry(clean_node)
-                        .and_modify(|(prev_raw, ts)| {
-                            if last_seen_ns > *ts {
-                                *ts = last_seen_ns;
-                                *prev_raw = raw_node.clone();
-                            }
-                        })
-                        .or_insert((raw_node, last_seen_ns));
                 }
+            }
+        }
 
-                for (clean_node, (raw_node, last_seen_ns)) in node_last_seen {
-                    let lag_ns = anchor_ts.saturating_sub(last_seen_ns);
-                    if lag_ns > staleness_threshold_ns {
-                        let last_trace: Option<String> = conn
-                            .query_row(
-                                "SELECT trace_id FROM v_traces WHERE node_id = ?1 AND (?2 IS NULL OR end_time_unix_nano >= ?2) ORDER BY end_time_unix_nano DESC LIMIT 1",
-                                params![raw_node, exclusions.monitoring_since_unix_nano],
-                                |r| r.get(0),
-                            )
-                            .ok();
-                        let lag_secs = lag_ns / 1_000_000_000;
-                        problems.push(ProblemCard {
-                            problem_id: format!("PROB-HEARTBEAT-{clean_node}"),
-                            title: format!("Node Heartbeat Staleness on {clean_node}"),
-                            severity: "warning".into(),
-                            status: "OPEN".into(),
-                            category: "heartbeat_staleness".into(),
-                            impacted_entity: clean_node.clone(),
-                            slo_metric: format!("heartbeat_lag_secs={lag_secs}s (threshold=300s)"),
-                            root_cause_trace_id: last_trace,
-                            artifact_digest: None,
-                            detected_at_ms,
-                            summary: format!(
-                                "Host '{clean_node}' last reported telemetry {lag_secs}s ago"
-                            ),
-                            maintenance_suppressed: None,
-                            maintenance_subsystem: None,
-                            maintenance_state: None,
-                        });
+        if !canonical_hosts.is_empty() {
+            if let Ok(mut hb_stmt) = conn.prepare(
+                r#"
+                SELECT node_id, service_name, attributes_json, MAX(ts_ns) AS last_seen_ns
+                FROM (
+                    SELECT node_id, service_name, COALESCE(attributes_json, '') AS attributes_json, end_time_unix_nano AS ts_ns
+                    FROM v_traces
+                    WHERE (?1 IS NULL OR end_time_unix_nano >= ?1)
+                      AND TRIM(node_id) != ''
+                    UNION ALL
+                    SELECT node_id, service_name, COALESCE(attributes_json, '') AS attributes_json, timestamp_unix_nano AS ts_ns
+                    FROM v_metrics
+                    WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+                      AND TRIM(node_id) != ''
+                    UNION ALL
+                    SELECT node_id, service_name, COALESCE(attributes_json, '') AS attributes_json, timestamp_unix_nano AS ts_ns
+                    FROM v_logs
+                    WHERE (?1 IS NULL OR timestamp_unix_nano >= ?1)
+                      AND TRIM(node_id) != ''
+                )
+                GROUP BY node_id, service_name, attributes_json
+                "#,
+            ) {
+                if let Ok(rows) =
+                    hb_stmt.query_map(params![exclusions.monitoring_since_unix_nano], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                {
+                    let mut node_last_seen: BTreeMap<String, (String, i64)> = BTreeMap::new();
+                    for (raw_node, raw_svc, attrs_json, last_seen_ns) in rows.flatten() {
+                        let clean_svc = redactor.redact_str(&raw_svc);
+                        if exclusions.is_service_excluded(&raw_svc)
+                            || exclusions.is_service_excluded(&clean_svc)
+                            || exclusions.is_attributes_excluded_from_slo(&attrs_json)
+                        {
+                            continue;
+                        }
+                        let clean_node = redactor.redact_host(&raw_node);
+                        if !canonical_hosts.contains(&clean_node) {
+                            continue;
+                        }
+                        node_last_seen
+                            .entry(clean_node)
+                            .and_modify(|(prev_raw, ts)| {
+                                if last_seen_ns > *ts {
+                                    *ts = last_seen_ns;
+                                    *prev_raw = raw_node.clone();
+                                }
+                            })
+                            .or_insert((raw_node, last_seen_ns));
+                    }
+
+                    for (clean_node, (raw_node, last_seen_ns)) in node_last_seen {
+                        let lag_ns = anchor_ts.saturating_sub(last_seen_ns);
+                        if lag_ns > staleness_threshold_ns {
+                            let last_trace = find_latest_trace_for_node(
+                                &conn,
+                                &raw_node,
+                                exclusions.monitoring_since_unix_nano,
+                                exclusions,
+                            );
+                            let lag_secs = lag_ns / 1_000_000_000;
+                            problems.push(ProblemCard {
+                                problem_id: format!("PROB-HEARTBEAT-{clean_node}"),
+                                title: format!("Node Heartbeat Staleness on {clean_node}"),
+                                severity: "warning".into(),
+                                status: "OPEN".into(),
+                                category: "heartbeat_staleness".into(),
+                                impacted_entity: clean_node.clone(),
+                                slo_metric: format!(
+                                    "heartbeat_lag_secs={lag_secs}s (threshold=300s)"
+                                ),
+                                root_cause_trace_id: last_trace,
+                                artifact_digest: None,
+                                detected_at_ms,
+                                summary: format!(
+                                    "Host '{clean_node}' last reported telemetry {lag_secs}s ago"
+                                ),
+                                maintenance_suppressed: None,
+                                maintenance_subsystem: None,
+                                maintenance_state: None,
+                            });
+                        }
                     }
                 }
             }
@@ -799,7 +866,8 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }) {
             for pair in rows.flatten() {
                 let clean_repo = redactor.redact_str(&pair.0);
-                if exclusions.is_repo_excluded(&pair.0) || exclusions.is_repo_excluded(&clean_repo)
+                if !exclusions.is_repo_monitored(&pair.0)
+                    || !exclusions.is_repo_monitored(&clean_repo)
                 {
                     continue;
                 }
@@ -827,7 +895,8 @@ pub fn evaluate_deterministic_problems_with_exclusions(
         }) {
             for rk in rows.flatten() {
                 let clean_repo = redactor.redact_str(&rk);
-                if exclusions.is_repo_excluded(&rk) || exclusions.is_repo_excluded(&clean_repo) {
+                if !exclusions.is_repo_monitored(&rk) || !exclusions.is_repo_monitored(&clean_repo)
+                {
                     continue;
                 }
                 if !test_repos.contains(&rk) {
@@ -940,34 +1009,86 @@ pub fn evaluate_deterministic_problems_with_exclusions(
     })
 }
 
+fn is_host_daemon_metric(service_name: &str, metric_name: &str) -> bool {
+    let svc = service_name.trim().to_ascii_lowercase();
+    let metric = metric_name.trim().to_ascii_lowercase();
+    matches!(
+        svc.as_str(),
+        "musentinel"
+            | "mu-sentinel"
+            | "mu-observable-sentinel"
+            | "mu-observable-collector"
+            | "muobserve-collector"
+            | "muobservable-collector"
+    ) || metric.starts_with("host.")
+        || metric.starts_with("system.")
+}
+
+fn find_latest_trace_for_node(
+    conn: &duckdb::Connection,
+    raw_node: &str,
+    min_ts: Option<i64>,
+    exclusions: &MonitoringExclusions,
+) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT trace_id, COALESCE(attributes_json, '')
+            FROM v_traces
+            WHERE node_id = ?1
+              AND (?2 IS NULL OR end_time_unix_nano >= ?2)
+            ORDER BY end_time_unix_nano DESC
+            "#,
+        )
+        .ok()?;
+    let mut rows = stmt.query(params![raw_node, min_ts]).ok()?;
+    while let Ok(Some(r)) = rows.next() {
+        let tid: String = r.get(0).ok()?;
+        let attrs: String = r.get(1).unwrap_or_default();
+        if !exclusions.is_attributes_excluded_from_slo(&attrs) {
+            return Some(tid);
+        }
+    }
+    None
+}
+
 fn find_slowest_trace_for_service(
     conn: &duckdb::Connection,
     sanitized_service: &str,
     cutoff_ts: i64,
+    exclusions: &MonitoringExclusions,
 ) -> Option<String> {
-    conn.query_row(
-        r#"
-        SELECT trace_id
-        FROM v_traces
-        WHERE service_name = ?1
-          AND end_time_unix_nano >= ?2
-          AND NOT (
-              STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.pipeline.')
-              OR STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.stage.')
-          )
-        ORDER BY duration_ns DESC
-        LIMIT 1
-        "#,
-        params![sanitized_service, cutoff_ts],
-        |r| r.get(0),
-    )
-    .ok()
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT trace_id, COALESCE(attributes_json, '')
+            FROM v_traces
+            WHERE service_name = ?1
+              AND end_time_unix_nano >= ?2
+              AND NOT (
+                  STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.pipeline.')
+                  OR STARTS_WITH(LOWER(TRIM(COALESCE(span_name, ''))), 'ci.stage.')
+              )
+            ORDER BY duration_ns DESC
+            "#,
+        )
+        .ok()?;
+    let mut rows = stmt.query(params![sanitized_service, cutoff_ts]).ok()?;
+    while let Ok(Some(r)) = rows.next() {
+        let tid: String = r.get(0).ok()?;
+        let attrs: String = r.get(1).unwrap_or_default();
+        if !exclusions.is_attributes_excluded_from_slo(&attrs) {
+            return Some(tid);
+        }
+    }
+    None
 }
 
 fn find_error_trace_for_service(
     conn: &duckdb::Connection,
     sanitized_service: &str,
     cutoff_ts: i64,
+    exclusions: &MonitoringExclusions,
 ) -> Option<String> {
     let mut stmt = conn
         .prepare(
@@ -986,7 +1107,9 @@ fn find_error_trace_for_service(
         let tid: String = r.get(0).ok()?;
         let sn: String = r.get(1).unwrap_or_default();
         let attrs: String = r.get(2).unwrap_or_default();
-        if !is_user_ci_failure_span(&sn, &attrs) {
+        if !is_user_ci_failure_span(&sn, &attrs)
+            && !exclusions.is_attributes_excluded_from_slo(&attrs)
+        {
             return Some(tid);
         }
     }
